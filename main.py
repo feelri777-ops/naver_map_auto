@@ -173,6 +173,25 @@ window.__updateMarker = function() {
     }
 };
 setInterval(window.__updateMarker, 100);
+
+// 네이버 지도 UI 요소 숨기기/보이기
+window.__toggleNaverUI = function() {
+    let style = document.getElementById('__naver_ui_hider');
+    if (style) {
+        style.remove();
+    } else {
+        style = document.createElement('style');
+        style.id = '__naver_ui_hider';
+        style.innerHTML = `
+            #header, #sidebar, .search_area, 
+            .control_container, .copyright_container, 
+            .entrance_container, .map_logo {
+                display: none !important;
+            }
+        `;
+        document.head.appendChild(style);
+    }
+};
 """
 
 
@@ -180,7 +199,7 @@ class App:
     def __init__(self):
         self.root = tk.Tk()
         self.root.title("네이버 실내지도 다운로드")
-        self.root.geometry("420x580")
+        self.root.geometry("420x620")
         self.root.resizable(False, False)
 
         self.page = None
@@ -220,6 +239,11 @@ class App:
         self.btn_reset = tk.Button(btn_frame, text="위치 다시 잡기", width=20, height=2,
                                     command=self._on_reset, state="disabled")
         self.btn_reset.pack(pady=3)
+
+        self.btn_toggle_ui = tk.Button(btn_frame, text="네이버 도구 숨기기 / 보이기", width=30, height=2,
+                                        command=self._toggle_naver_ui, state="disabled",
+                                        bg="#607D8B", fg="white")
+        self.btn_toggle_ui.pack(pady=5)
 
         self.btn_start = tk.Button(btn_frame, text="4. 촬영 시작!", width=20, height=2,
                                     command=self._on_start, state="disabled",
@@ -301,7 +325,12 @@ class App:
                            "  2. 전체 영역이 보이도록 적당히 축소\n"
                            "  3. 화면 좌상단 코너에 시작점을 맞추고 [좌상단 코너 지정]")
         self.btn_top_left.config(state="normal")
+        self.btn_toggle_ui.config(state="normal")
         self.state = "init"
+
+    def _toggle_naver_ui(self):
+        if self.page:
+            asyncio.get_event_loop().run_until_complete(self.page.evaluate("window.__toggleNaverUI()"))
 
     # ============================================================
     # 2. 좌상단 코너 지정
