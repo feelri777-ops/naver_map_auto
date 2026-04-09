@@ -12,7 +12,11 @@ import os
 import math
 import re
 import tkinter as tk
-from tkinter import messagebox
+from tkinter import messagebox, ttk
+from PIL import Image, ImageTk
+import io
+import cv2
+import numpy as np
 from playwright.async_api import async_playwright
 import config
 
@@ -80,11 +84,16 @@ async def zoom_to_max(page, log_fn=None):
 
     after_zoom = get_zoom_from_url(page.url)
 
-    if before_zoom and after_zoom and after_zoom > before_zoom:
-        ratio = 2 ** (after_zoom - before_zoom)
-        if log_fn:
-            log_fn(f"줌: {before_zoom:.2f} → {after_zoom:.2f} (x{ratio:.1f})")
-        return ratio
+    if before_zoom and after_zoom:
+        if after_zoom > before_zoom:
+            ratio = 2 ** (after_zoom - before_zoom)
+            if log_fn:
+                log_fn(f"줌: {before_zoom:.2f} → {after_zoom:.2f} (x{ratio:.1f})")
+            return ratio
+        else:
+            if log_fn:
+                log_fn(f"이미 최대 확대 상태 (줌 레벨: {after_zoom:.2f}) — 비율 x1")
+            return 1.0
     else:
         if log_fn:
             log_fn("줌 레벨 확인 불가 — 기본 비율(x8) 사용")
@@ -105,74 +114,236 @@ async def click_download(page):
 
 
 # ============================================================
+# 이미지 병합 클래스 (OpenCV 템플릿 매칭 정밀 정렬)
+# ============================================================
+class MapStitcher:
+    def __init__(self, rows, cols, tile_w, tile_h, step_x, step_y):
+        self.rows = rows
+        self.cols = cols
+        self.tile_w = int(tile_w)
+        self.tile_h = int(tile_h)
+        self.step_x = int(step_x)
+        self.step_y = int(step_y)
+
+        # 타일별 실제 배치 좌표 (정밀 정렬 후 갱신)
+        self.positions = {}  # (row, col) -> (x, y)
+        # 타일 이미지 캐시
+        self.tiles = {}  # (row, col) -> numpy array
+
+    def _find_offset(self, base_img, new_img, direction):
+        """
+        템플릿 매칭으로 두 이미지 간 정확한 오프셋을 찾는다.
+        direction: 'h' (가로 인접) 또는 'v' (세로 인접)
+        """
+        gray_base = cv2.cvtColor(base_img, cv2.COLOR_BGR2GRAY)
+        gray_new = cv2.cvtColor(new_img, cv2.COLOR_BGR2GRAY)
+
+        h_b, w_b = gray_base.shape
+        h_n, w_n = gray_new.shape
+
+        if direction == 'h':
+            # 가로: base 우측 겹침 영역 vs new 좌측 영역
+            overlap_est = w_b - self.step_x
+            margin = max(50, overlap_est // 3)
+            overlap_min = max(10, overlap_est - margin)
+            overlap_max = min(w_b, w_n, overlap_est + margin)
+
+            # base 우측에서 탐색 템플릿 추출
+            tmpl_w = max(10, overlap_min // 2)
+            tmpl_x = w_b - overlap_est
+            # 세로 중앙 부분만 사용 (노이즈 줄이기)
+            cy = h_b // 2
+            tmpl_h = min(h_b // 3, 200)
+            ty1 = cy - tmpl_h // 2
+            ty2 = ty1 + tmpl_h
+
+            template = gray_base[ty1:ty2, tmpl_x:tmpl_x + tmpl_w]
+            if template.size == 0:
+                return self.step_x, 0
+
+            # new 이미지 좌측 검색 영역
+            search_w = min(overlap_max + margin, w_n)
+            search = gray_new[ty1:ty2, 0:search_w]
+            if search.shape[1] <= template.shape[1] or search.shape[0] <= template.shape[0]:
+                return self.step_x, 0
+
+            res = cv2.matchTemplate(search, template, cv2.TM_CCOEFF_NORMED)
+            _, max_val, _, max_loc = cv2.minMaxLoc(res)
+
+            if max_val > 0.5:
+                # new 이미지에서 템플릿이 발견된 x 위치
+                match_x_in_new = max_loc[0]
+                # base에서 템플릿 시작 x = tmpl_x
+                # 따라서 실제 수평 오프셋 = w_b - tmpl_x + match_x_in_new... 아니라
+                # base의 tmpl_x 위치와 new의 match_x가 같은 지도 위치
+                # offset_x = w_b - (tmpl_x - 0) - (match_x_in_new - 0) = w_b - tmpl_x + ...
+                # 더 단순하게: base 원점 기준 tmpl_x, new 원점 기준 match_x가 같은 점
+                # new의 원점 = base 원점 + offset_x → offset_x = tmpl_x - match_x_in_new
+                dx = tmpl_x - match_x_in_new
+                return dx, 0
+            return self.step_x, 0
+
+        else:
+            # 세로: base 하단 겹침 영역 vs new 상단 영역
+            overlap_est = h_b - self.step_y
+            margin = max(50, overlap_est // 3)
+            overlap_min = max(10, overlap_est - margin)
+            overlap_max = min(h_b, h_n, overlap_est + margin)
+
+            tmpl_h = max(10, overlap_min // 2)
+            tmpl_y = h_b - overlap_est
+            cx = w_b // 2
+            tmpl_w = min(w_b // 3, 200)
+            tx1 = cx - tmpl_w // 2
+            tx2 = tx1 + tmpl_w
+
+            template = gray_base[tmpl_y:tmpl_y + tmpl_h, tx1:tx2]
+            if template.size == 0:
+                return 0, self.step_y
+
+            search_h = min(overlap_max + margin, h_n)
+            search = gray_new[0:search_h, tx1:tx2]
+            if search.shape[0] <= template.shape[0] or search.shape[1] <= template.shape[1]:
+                return 0, self.step_y
+
+            res = cv2.matchTemplate(search, template, cv2.TM_CCOEFF_NORMED)
+            _, max_val, _, max_loc = cv2.minMaxLoc(res)
+
+            if max_val > 0.5:
+                match_y_in_new = max_loc[1]
+                dy = tmpl_y - match_y_in_new
+                return 0, dy
+            return 0, self.step_y
+
+    def add_tile(self, row, col_idx, direction, img_path):
+        img = cv2.imread(img_path)
+        if img is None:
+            return
+
+        # 스네이크 패턴에 따른 실제 그리드 좌표
+        if direction == 1:
+            col = col_idx
+        else:
+            col = (self.cols - 1) - col_idx
+
+        self.tiles[(row, col)] = img
+
+        # 첫 타일
+        if not self.positions:
+            self.positions[(row, col)] = (0, 0)
+            return
+
+        # 가로 인접 타일과 매칭
+        if (row, col - 1) in self.positions and (row, col - 1) in self.tiles:
+            base = self.tiles[(row, col - 1)]
+            bx, by = self.positions[(row, col - 1)]
+            dx, dy = self._find_offset(base, img, 'h')
+            self.positions[(row, col)] = (bx + dx, by + dy)
+        elif (row, col + 1) in self.positions and (row, col + 1) in self.tiles:
+            base = self.tiles[(row, col + 1)]
+            bx, by = self.positions[(row, col + 1)]
+            dx, dy = self._find_offset(base, img, 'h')
+            self.positions[(row, col)] = (bx - dx, by - dy)
+        # 세로 인접 타일과 매칭
+        elif (row - 1, col) in self.positions and (row - 1, col) in self.tiles:
+            base = self.tiles[(row - 1, col)]
+            bx, by = self.positions[(row - 1, col)]
+            dx, dy = self._find_offset(base, img, 'v')
+            self.positions[(row, col)] = (bx + dx, by + dy)
+        else:
+            # 폴백: 예상 위치 사용
+            self.positions[(row, col)] = (col * self.step_x, row * self.step_y)
+
+        # 행의 첫 타일이면서 위쪽 행이 있으면, 세로 정렬 보정
+        if col_idx == 0 and row > 0:
+            above_col = col
+            if (row - 1, above_col) in self.positions and (row - 1, above_col) in self.tiles:
+                base = self.tiles[(row - 1, above_col)]
+                bx, by = self.positions[(row - 1, above_col)]
+                dx, dy = self._find_offset(base, img, 'v')
+                self.positions[(row, col)] = (bx + dx, by + dy)
+
+    def save(self, path):
+        if not self.positions:
+            return
+
+        # 모든 위치의 최소값 계산 (음수 좌표 보정)
+        min_x = min(p[0] for p in self.positions.values())
+        min_y = min(p[1] for p in self.positions.values())
+
+        # 캔버스 크기 계산
+        max_x = 0
+        max_y = 0
+        for (r, c), (px, py) in self.positions.items():
+            if (r, c) in self.tiles:
+                h, w = self.tiles[(r, c)].shape[:2]
+                max_x = max(max_x, px - min_x + w)
+                max_y = max(max_y, py - min_y + h)
+
+        canvas = np.zeros((int(max_y), int(max_x), 3), dtype=np.uint8)
+        canvas.fill(240)
+
+        # 뒤에서부터 그려서 먼저 배치된 타일이 위에 오도록
+        sorted_keys = sorted(self.positions.keys(), key=lambda k: (k[0], k[1]), reverse=True)
+        for (r, c) in sorted_keys:
+            if (r, c) not in self.tiles:
+                continue
+            img = self.tiles[(r, c)]
+            px = int(self.positions[(r, c)][0] - min_x)
+            py = int(self.positions[(r, c)][1] - min_y)
+            h, w = img.shape[:2]
+
+            y_end = min(py + h, canvas.shape[0])
+            x_end = min(px + w, canvas.shape[1])
+            if py < 0 or px < 0:
+                continue
+            canvas[py:y_end, px:x_end] = img[0:y_end - py, 0:x_end - px]
+
+        cv2.imwrite(path, canvas)
+
+
+# ============================================================
 # 오버레이 JS
 # ============================================================
 OVERLAY_JS = """
 const overlay = document.createElement('div');
 overlay.id = '__map_overlay';
 overlay.innerHTML = `
-    <!-- 좌상단 코너: 안쪽 여백 70px, 빨간 긴 선 -->
-    <div id="__corner_tl" style="position:fixed; left:70px; top:90px; z-index:99999; pointer-events:none; display:none;">
-        <div style="position:absolute; left:0; top:0; width:2000px; height:3px; background:#ff0000; opacity:0.8;"></div>
-        <div style="position:absolute; left:0; top:0; width:3px; height:2000px; background:#ff0000; opacity:0.8;"></div>
-        <div style="position:absolute; left:10px; top:10px; background:rgba(200,0,0,0.9); color:white;
-            padding:5px 12px; border-radius:4px; font-size:14px; font-weight:bold; white-space:nowrap;">좌상단</div>
-    </div>
+    <!-- 경계선 표시 (상/하/좌/우) -->
+    <div id="__edge_top" style="position:fixed; left:0; top:0; width:100%; height:3px; background:#00ff88; z-index:99998; pointer-events:none; display:none; box-shadow:0 0 8px #00ff88;"></div>
+    <div id="__edge_bottom" style="position:fixed; left:0; bottom:0; width:100%; height:3px; background:#00ff88; z-index:99998; pointer-events:none; display:none; box-shadow:0 0 8px #00ff88;"></div>
+    <div id="__edge_left" style="position:fixed; left:0; top:0; width:3px; height:100%; background:#00ff88; z-index:99998; pointer-events:none; display:none; box-shadow:0 0 8px #00ff88;"></div>
+    <div id="__edge_right" style="position:fixed; right:0; top:0; width:3px; height:100%; background:#00ff88; z-index:99998; pointer-events:none; display:none; box-shadow:0 0 8px #00ff88;"></div>
 
-    <!-- 우하단 코너: 안쪽 여백 70/40px -->
-    <div id="__corner_br" style="position:fixed; right:70px; bottom:40px; z-index:99999; pointer-events:none; display:none;">
-        <div style="position:absolute; right:0; bottom:0; width:2000px; height:3px; background:#ff0000; opacity:0.8;"></div>
-        <div style="position:absolute; right:0; bottom:0; width:3px; height:2000px; background:#ff0000; opacity:0.8;"></div>
-        <div style="position:absolute; right:10px; bottom:10px; background:rgba(200,0,0,0.9); color:white;
-            padding:5px 12px; border-radius:4px; font-size:14px; font-weight:bold; white-space:nowrap;">우하단</div>
-    </div>
+    <!-- 경계선 라벨 -->
+    <div id="__edge_label_top" style="position:fixed; left:50%; top:6px; transform:translateX(-50%); background:#00ff88; color:#000; padding:2px 10px; border-radius:4px; font-size:12px; font-weight:bold; z-index:99999; pointer-events:none; display:none;">▲ 상단</div>
+    <div id="__edge_label_bottom" style="position:fixed; left:50%; bottom:6px; transform:translateX(-50%); background:#00ff88; color:#000; padding:2px 10px; border-radius:4px; font-size:12px; font-weight:bold; z-index:99999; pointer-events:none; display:none;">▼ 하단</div>
+    <div id="__edge_label_left" style="position:fixed; left:6px; top:50%; transform:translateY(-50%); background:#00ff88; color:#000; padding:2px 10px; border-radius:4px; font-size:12px; font-weight:bold; z-index:99999; pointer-events:none; display:none;">◀ 좌측</div>
+    <div id="__edge_label_right" style="position:fixed; right:6px; top:50%; transform:translateY(-50%); background:#00ff88; color:#000; padding:2px 10px; border-radius:4px; font-size:12px; font-weight:bold; z-index:99999; pointer-events:none; display:none;">▶ 우측</div>
 
-    <!-- 안내 라벨 (화면 상단 중앙) -->
+    <!-- 안내 라벨 -->
     <div id="__guide_label" style="position:fixed; left:50%; top:20px; transform:translateX(-50%);
-        background:rgba(0,0,0,0.8); color:white; padding:10px 20px; border-radius:8px;
-        font-size:15px; font-weight:bold; z-index:99999; pointer-events:none; display:none;
-        white-space:nowrap;"></div>
-
-    <!-- 선택 영역 사각형 -->
-    <div id="__area_rect" style="position:fixed; border:3px dashed rgba(255,0,0,0.5);
-        background:rgba(255,0,0,0.05); z-index:99998; pointer-events:none; display:none;"></div>
-
-    <!-- 좌상단 추적 마커 (드래그 후에도 위치 추적) -->
-    <div id="__mark_tl_dot" style="position:fixed; z-index:99999; pointer-events:none; display:none;">
-        <div style="position:absolute; left:0; top:0; width:2000px; height:2px; background:#ff3333; opacity:0.6;"></div>
-        <div style="position:absolute; left:0; top:0; width:2px; height:2000px; background:#ff3333; opacity:0.6;"></div>
-    </div>
+        background:rgba(0,0,0,0.85); color:white; padding:12px 24px; border-radius:30px;
+        font-size:16px; font-weight:bold; z-index:99999; pointer-events:none; display:none;
+        white-space:nowrap; border: 2px solid #ff4444;"></div>
 `;
 document.body.appendChild(overlay);
 
-// 좌상단 마커의 초기 화면 좌표
-window.__markerScreenX = 0;
-window.__markerScreenY = 0;
+window.__totalDragX = 0;
+window.__totalDragY = 0;
+window.__tracking = true;
 
-// 마커 실시간 업데이트
-window.__updateMarker = function() {
-    const dot = document.getElementById('__mark_tl_dot');
-    const rect = document.getElementById('__area_rect');
-    if (dot && dot.style.display !== 'none') {
-        const dx = window.__totalDragX || 0;
-        const dy = window.__totalDragY || 0;
-        const mx = window.__markerScreenX - dx;
-        const my = window.__markerScreenY - dy;
-        dot.style.left = mx + 'px';
-        dot.style.top = my + 'px';
+document.addEventListener('mousedown', (e) => {
+    window.__lastX = e.clientX;
+    window.__lastY = e.clientY;
+});
 
-        // 사각형: 좌상단 마커 ~ 우하단 코너(화면 우하단)
-        if (rect.style.display !== 'none') {
-            const right = window.innerWidth - 70;
-            const bottom = window.innerHeight - 40;
-            rect.style.left = mx + 'px';
-            rect.style.top = my + 'px';
-            rect.style.width = Math.max(0, right - mx) + 'px';
-            rect.style.height = Math.max(0, bottom - my) + 'px';
-        }
+document.addEventListener('mouseup', (e) => {
+    if (window.__tracking) {
+        window.__totalDragX += (window.__lastX - e.clientX);
+        window.__totalDragY += (window.__lastY - e.clientY);
     }
-};
-setInterval(window.__updateMarker, 100);
+});
 
 // 네이버 지도 UI 요소 숨기기/보이기
 window.__toggleNaverUI = function() {
@@ -183,8 +354,8 @@ window.__toggleNaverUI = function() {
         style = document.createElement('style');
         style.id = '__naver_ui_hider';
         style.innerHTML = `
-            #header, #sidebar, .search_area, 
-            .control_container, .copyright_container, 
+            #header, .search_area,
+            .control_container, .copyright_container,
             .entrance_container, .map_logo {
                 display: none !important;
             }
@@ -199,71 +370,175 @@ class App:
     def __init__(self):
         self.root = tk.Tk()
         self.root.title("네이버 실내지도 다운로드")
-        self.root.geometry("420x620")
+        self.root.geometry("1400x900")
         self.root.resizable(False, False)
 
         self.page = None
         self.context = None
         self.pw = None
-        self.total_dx = 0
-        self.total_dy = 0
+        
+        # 신규 4방향 경계값
+        self.bounds = {'top': None, 'bottom': None, 'left': None, 'right': None}
+        
         self.state = "init"
         self.stop_requested = False
+
+        # 이미지 캐시
+        self.overview_img = None
+        self.overview_photo = None
+        self.canvas_width = 900
+        self.canvas_height = 800
+        self.rect_id = None
 
         self._build_ui()
 
     def _build_ui(self):
-        self.status_var = tk.StringVar(value="브라우저를 열어주세요")
-        tk.Label(self.root, textvariable=self.status_var, font=("맑은 고딕", 11, "bold"),
-                 wraplength=380, justify="center").pack(pady=(15, 10))
+        # 라이트 테마 색상
+        self.bg_color = "#f5f5f7"
+        self.panel_color = "#ffffff"
+        self.accent_color = "#2563eb"
+        self.text_color = "#1a1a1a"
+        self.secondary_text = "#6b7280"
+        self.border_color = "#e5e7eb"
+        self.green = "#16a34a"
+        self.red = "#dc2626"
 
-        self.guide_var = tk.StringVar(value="")
-        tk.Label(self.root, textvariable=self.guide_var, font=("맑은 고딕", 9),
-                 wraplength=380, justify="left", fg="#555").pack(pady=(0, 10))
+        self.root.configure(bg=self.bg_color)
 
-        btn_frame = tk.Frame(self.root)
-        btn_frame.pack(pady=5)
+        # ttk 스타일 설정
+        style = ttk.Style()
+        style.theme_use("clam")
 
-        self.btn_open = tk.Button(btn_frame, text="1. 브라우저 열기", width=20, height=2,
-                                   command=self._on_open_browser)
-        self.btn_open.pack(pady=3)
+        style.configure("Title.TLabel", background=self.bg_color, foreground=self.accent_color,
+                         font=("Segoe UI", 15, "bold"))
+        style.configure("Guide.TLabel", background=self.bg_color, foreground=self.secondary_text,
+                         font=("Segoe UI", 9))
+        style.configure("Status.TLabel", background=self.panel_color, foreground=self.secondary_text,
+                         font=("Consolas", 9))
+        style.configure("Progress.TLabel", background=self.bg_color, foreground=self.text_color,
+                         font=("Segoe UI", 9))
 
-        self.btn_top_left = tk.Button(btn_frame, text="2. 좌상단 코너 지정", width=20, height=2,
-                                       command=self._on_set_top_left, state="disabled")
-        self.btn_top_left.pack(pady=3)
+        style.configure("Primary.TButton", font=("Segoe UI", 9), padding=(12, 8))
+        style.map("Primary.TButton",
+                   background=[("active", "#1d4ed8"), ("!disabled", self.accent_color), ("disabled", "#d1d5db")],
+                   foreground=[("!disabled", "white"), ("disabled", "#9ca3af")])
 
-        self.btn_bottom_right = tk.Button(btn_frame, text="3. 우하단 코너 지정", width=20, height=2,
-                                           command=self._on_set_bottom_right, state="disabled")
-        self.btn_bottom_right.pack(pady=3)
+        style.configure("Green.TButton", font=("Segoe UI", 10, "bold"), padding=(12, 10))
+        style.map("Green.TButton",
+                   background=[("active", "#15803d"), ("!disabled", self.green), ("disabled", "#d1d5db")],
+                   foreground=[("!disabled", "white"), ("disabled", "#9ca3af")])
 
-        self.btn_reset = tk.Button(btn_frame, text="위치 다시 잡기", width=20, height=2,
-                                    command=self._on_reset, state="disabled")
-        self.btn_reset.pack(pady=3)
+        style.configure("Red.TButton", font=("Segoe UI", 9), padding=(12, 8))
+        style.map("Red.TButton",
+                   background=[("active", "#b91c1c"), ("!disabled", self.red), ("disabled", "#d1d5db")],
+                   foreground=[("!disabled", "white"), ("disabled", "#9ca3af")])
 
-        self.btn_toggle_ui = tk.Button(btn_frame, text="네이버 도구 숨기기 / 보이기", width=30, height=2,
-                                        command=self._toggle_naver_ui, state="disabled",
-                                        bg="#607D8B", fg="white")
-        self.btn_toggle_ui.pack(pady=5)
+        style.configure("Edge.TButton", font=("Segoe UI", 9), padding=(8, 6))
+        style.map("Edge.TButton",
+                   background=[("active", "#e0e7ff"), ("!disabled", "#eef2ff"), ("disabled", "#f3f4f6")],
+                   foreground=[("!disabled", "#3730a3"), ("disabled", "#9ca3af")])
 
-        self.btn_start = tk.Button(btn_frame, text="4. 촬영 시작!", width=20, height=2,
-                                    command=self._on_start, state="disabled",
-                                    bg="#4CAF50", fg="white", font=("맑은 고딕", 10, "bold"))
-        self.btn_start.pack(pady=5)
+        style.configure("Card.TLabelframe", background=self.panel_color, relief="solid", borderwidth=1)
+        style.configure("Card.TLabelframe.Label", background=self.panel_color, foreground=self.accent_color,
+                         font=("Segoe UI", 9, "bold"))
 
-        self.btn_stop = tk.Button(btn_frame, text="촬영 중지", width=20, height=2,
-                                   command=self._on_stop, state="disabled",
-                                   bg="#f44336", fg="white", font=("맑은 고딕", 10, "bold"))
-        self.btn_stop.pack(pady=5)
+        # 전체 레이아웃
+        main_frame = tk.Frame(self.root, bg=self.bg_color)
+        main_frame.pack(fill="both", expand=True, padx=16, pady=16)
+
+        left_frame = tk.Frame(main_frame, width=400, bg=self.bg_color)
+        left_frame.pack(side="left", fill="y")
+
+        # 미니맵 카드
+        right_card = tk.Frame(main_frame, bg=self.panel_color, highlightbackground=self.border_color,
+                               highlightthickness=1, padx=8, pady=8)
+        right_card.pack(side="right", fill="both", expand=True, padx=(16, 0))
+
+        tk.Label(right_card, text="미니맵", font=("Segoe UI", 10, "bold"),
+                 bg=self.panel_color, fg=self.text_color, anchor="w").pack(fill="x", pady=(0, 6))
+
+        self.canvas = tk.Canvas(right_card, width=self.canvas_width, height=self.canvas_height,
+                                bg="#e8eaed", highlightthickness=1, highlightbackground=self.border_color)
+        self.canvas.pack(fill="both", expand=True)
+        self.canvas.create_text(325, 300, text="브라우저를 열어주세요",
+                                fill="#9ca3af", font=("Segoe UI", 11))
+
+        # --- 왼쪽 컨트롤 ---
+        self.status_var = tk.StringVar(value="Naver Map Downloader")
+        ttk.Label(left_frame, textvariable=self.status_var, style="Title.TLabel").pack(anchor="w", pady=(0, 2))
+
+        self.guide_var = tk.StringVar(value="브라우저 열기 버튼으로 시작하세요")
+        ttk.Label(left_frame, textvariable=self.guide_var, style="Guide.TLabel",
+                  wraplength=380).pack(anchor="w", pady=(0, 12))
+
+        # 1. 브라우저 열기
+        step1 = tk.Frame(left_frame, bg=self.bg_color)
+        step1.pack(fill="x", pady=(0, 8))
+
+        self.btn_open = ttk.Button(step1, text="브라우저 열기", style="Primary.TButton",
+                                    command=self._on_open_browser)
+        self.btn_open.pack(side="left", padx=(0, 6), fill="x", expand=True)
+
+        self.btn_toggle_ui = ttk.Button(step1, text="UI 숨김/표시", style="Primary.TButton",
+                                         command=self._toggle_naver_ui, state="disabled")
+        self.btn_toggle_ui.pack(side="left", fill="x", expand=True)
+
+        # 2. 경계 지정 카드
+        boundary_frame = ttk.LabelFrame(left_frame, text="  영역 경계 지정  ", style="Card.TLabelframe",
+                                         padding=(12, 10))
+        boundary_frame.pack(fill="x", pady=(0, 8))
+
+        y_btn_row = tk.Frame(boundary_frame, bg=self.panel_color)
+        y_btn_row.pack(fill="x", pady=(0, 4))
+        self.btn_top = ttk.Button(y_btn_row, text="상단 ↑", style="Edge.TButton",
+                                   command=lambda: self._on_set_edge('top'), state="disabled")
+        self.btn_top.pack(side="left", expand=True, padx=(0, 3))
+        self.btn_bottom = ttk.Button(y_btn_row, text="하단 ↓", style="Edge.TButton",
+                                      command=lambda: self._on_set_edge('bottom'), state="disabled")
+        self.btn_bottom.pack(side="left", expand=True, padx=(3, 0))
+
+        x_btn_row = tk.Frame(boundary_frame, bg=self.panel_color)
+        x_btn_row.pack(fill="x", pady=(0, 8))
+        self.btn_left = ttk.Button(x_btn_row, text="좌측 ←", style="Edge.TButton",
+                                    command=lambda: self._on_set_edge('left'), state="disabled")
+        self.btn_left.pack(side="left", expand=True, padx=(0, 3))
+        self.btn_right = ttk.Button(x_btn_row, text="우측 →", style="Edge.TButton",
+                                     command=lambda: self._on_set_edge('right'), state="disabled")
+        self.btn_right.pack(side="left", expand=True, padx=(3, 0))
+
+        self.bound_status_var = tk.StringVar(value="T: -  |  B: -  |  L: -  |  R: -")
+        ttk.Label(boundary_frame, textvariable=self.bound_status_var, style="Status.TLabel").pack()
+
+        # 3. 촬영 / 초기화
+        action_frame = tk.Frame(left_frame, bg=self.bg_color)
+        action_frame.pack(fill="x", pady=(0, 6))
+
+        self.btn_start = ttk.Button(action_frame, text="촬영 시작", style="Green.TButton",
+                                     command=self._on_start, state="disabled")
+        self.btn_start.pack(side="left", padx=(0, 6), fill="x", expand=True)
+
+        self.btn_reset = ttk.Button(action_frame, text="초기화", style="Red.TButton",
+                                     command=self._on_reset, state="disabled")
+        self.btn_reset.pack(side="left", fill="x", expand=True)
+
+        self.btn_stop = ttk.Button(left_frame, text="촬영 중지", style="Red.TButton",
+                                    command=self._on_stop, state="disabled")
+        self.btn_stop.pack(fill="x", pady=(0, 8))
 
         self.progress_var = tk.StringVar(value="")
-        tk.Label(self.root, textvariable=self.progress_var, font=("맑은 고딕", 10),
-                 wraplength=380, justify="left").pack(pady=5)
+        ttk.Label(left_frame, textvariable=self.progress_var, style="Progress.TLabel",
+                  wraplength=380).pack(anchor="w", pady=(0, 6))
 
-        self.log_text = tk.Text(self.root, height=8, width=50, font=("Consolas", 9))
-        self.log_text.pack(pady=5, padx=10)
+        # 로그
+        log_frame = tk.Frame(left_frame, bg=self.border_color, padx=1, pady=1)
+        log_frame.pack(fill="both", expand=True)
+        self.log_text = tk.Text(log_frame, height=10, font=("Consolas", 9),
+                                 bg="#fafafa", fg="#374151", relief="flat",
+                                 borderwidth=0, padx=8, pady=6, selectbackground="#bfdbfe")
+        self.log_text.pack(fill="both", expand=True)
 
     def log(self, msg):
-        self.log_text.insert(tk.END, msg + "\n")
+        self.log_text.insert(tk.END, f"[{asyncio.get_event_loop().time():.1f}] {msg}\n")
         self.log_text.see(tk.END)
         self.root.update()
 
@@ -311,158 +586,132 @@ class App:
         # 오버레이 주입
         await self.page.evaluate(OVERLAY_JS)
 
-        # 처음부터 좌상단 코너 마커 + 안내 표시
+        # 안내 라벨 표시
         await self.page.evaluate("""
-            document.getElementById('__corner_tl').style.display = 'block';
             const guide = document.getElementById('__guide_label');
             guide.style.display = 'block';
-            guide.textContent = '화면 좌상단 코너에 시작점을 맞추세요';
+            guide.textContent = '각 경계선을 화면 가장자리에 맞추고 버튼을 누르세요';
         """)
 
         self.status_var.set("브라우저 준비 완료!")
-        self.guide_var.set("브라우저에서 수동으로:\n"
-                           "  1. 건물 검색 → 실내지도 → 원하는 층 선택\n"
-                           "  2. 전체 영역이 보이도록 적당히 축소\n"
-                           "  3. 화면 좌상단 코너에 시작점을 맞추고 [좌상단 코너 지정]")
-        self.btn_top_left.config(state="normal")
+        self.guide_var.set("지도를 드래그하여 경계를 화면 가장자리에 맞추고 버튼을 누르세요")
+        
+        # 버튼 활성화
+        self.btn_top.config(state="normal")
+        self.btn_bottom.config(state="normal")
+        self.btn_left.config(state="normal")
+        self.btn_right.config(state="normal")
         self.btn_toggle_ui.config(state="normal")
+        self.btn_reset.config(state="normal")
+        
         self.state = "init"
+
+    def _on_set_edge(self, edge):
+        if not self.page: return
+        asyncio.get_event_loop().run_until_complete(self._capture_edge(edge))
+
+    async def _capture_edge(self, edge):
+        dx = await self.page.evaluate("window.__totalDragX")
+        dy = await self.page.evaluate("window.__totalDragY")
+
+        if edge == 'top': self.bounds['top'] = dy
+        elif edge == 'bottom': self.bounds['bottom'] = dy
+        elif edge == 'left': self.bounds['left'] = dx
+        elif edge == 'right': self.bounds['right'] = dx
+
+        # 브라우저에 경계선 표시
+        await self.page.evaluate(f"""
+            document.getElementById('__edge_{edge}').style.display = 'block';
+            document.getElementById('__edge_label_{edge}').style.display = 'block';
+        """)
+
+        self._update_bound_status()
+        self.log(f"{edge.upper()} 경계 지정됨: {dx if edge in ['left','right'] else dy}px")
+
+        # 4개 다 설정되었으면 촬영 시작 버튼 활성화
+        if all(v is not None for v in self.bounds.values()):
+            self.btn_start.config(state="normal")
+            self.guide_var.set("영역 지정 완료! [3. 촬영 시작]을 누르세요")
+
+    def _update_bound_status(self):
+        t = f"{self.bounds['top']}" if self.bounds['top'] is not None else "-"
+        b = f"{self.bounds['bottom']}" if self.bounds['bottom'] is not None else "-"
+        l = f"{self.bounds['left']}" if self.bounds['left'] is not None else "-"
+        r = f"{self.bounds['right']}" if self.bounds['right'] is not None else "-"
+        self.bound_status_var.set(f"T: {t} | B: {b} | L: {l} | R: {r}")
 
     def _toggle_naver_ui(self):
         if self.page:
             asyncio.get_event_loop().run_until_complete(self.page.evaluate("window.__toggleNaverUI()"))
 
     # ============================================================
-    # 2. 좌상단 코너 지정
-    # ============================================================
-    def _on_set_top_left(self):
-        self.btn_top_left.config(state="disabled")
-        asyncio.get_event_loop().run_until_complete(self._set_top_left())
-
-    async def _set_top_left(self):
-        # 좌상단 확정 표시 + 우하단 코너 안내
-        await self.page.evaluate("""
-            // 좌상단 코너 확정 (어두운 빨간색)
-            const tlCorner = document.getElementById('__corner_tl');
-            tlCorner.querySelector('div:last-child').textContent = '좌상단 (확정)';
-            tlCorner.querySelector('div:last-child').style.background = 'rgba(150,0,0,0.95)';
-
-            // 좌상단 추적 마커 시작
-            window.__markerScreenX = 0;  // 좌상단 코너 = (0, 0)
-            window.__markerScreenY = 0;
-            document.getElementById('__mark_tl_dot').style.display = 'block';
-            document.getElementById('__area_rect').style.display = 'block';
-
-            // 우하단 코너 표시
-            document.getElementById('__corner_br').style.display = 'block';
-
-            // 안내 변경
-            const guide = document.getElementById('__guide_label');
-            guide.textContent = '화면 우하단 코너에 끝점을 맞추세요';
-        """)
-
-        # 드래그 추적 시작
-        await self.page.evaluate("""
-            window.__totalDragX = 0;
-            window.__totalDragY = 0;
-            window.__tracking = true;
-            window.__lastX = 0;
-            window.__lastY = 0;
-
-            if (!window.__dragListenerAdded) {
-                document.addEventListener('mousedown', (e) => {
-                    if (window.__tracking) {
-                        window.__lastX = e.clientX;
-                        window.__lastY = e.clientY;
-                    }
-                });
-                document.addEventListener('mouseup', (e) => {
-                    if (window.__tracking) {
-                        window.__totalDragX += (window.__lastX - e.clientX);
-                        window.__totalDragY += (window.__lastY - e.clientY);
-                    }
-                });
-                window.__dragListenerAdded = true;
-            } else {
-                window.__totalDragX = 0;
-                window.__totalDragY = 0;
-                window.__tracking = true;
-            }
-        """)
-
-        self.status_var.set("좌상단 코너 지정 완료!")
-        self.guide_var.set("지도를 드래그해서\n"
-                           "화면 우하단 코너에 끝점을 맞추고 [우하단 코너 지정]")
-        self.btn_bottom_right.config(state="normal")
-        self.btn_reset.config(state="normal")
-        self.state = "top_left_set"
-        self.log("좌상단 코너 지정됨")
-
-    # ============================================================
-    # 3. 우하단 코너 지정
-    # ============================================================
-    def _on_set_bottom_right(self):
-        self.btn_bottom_right.config(state="disabled")
-        asyncio.get_event_loop().run_until_complete(self._set_bottom_right())
-
-    async def _set_bottom_right(self):
-        await self.page.evaluate("window.__tracking = false;")
-        self.total_dx = await self.page.evaluate("window.__totalDragX")
-        self.total_dy = await self.page.evaluate("window.__totalDragY")
-
-        # 확정 표시
-        await self.page.evaluate("""
-            const guide = document.getElementById('__guide_label');
-            guide.textContent = '영역 지정 완료! — 촬영 준비 OK';
-            guide.style.background = 'rgba(0,150,0,0.9)';
-
-            const brCorner = document.getElementById('__corner_br');
-            brCorner.querySelector('div:last-child').textContent = '우하단 (확정)';
-            brCorner.querySelector('div:last-child').style.background = 'rgba(150,0,0,0.95)';
-        """)
-
-        self.log(f"이동 거리: {abs(self.total_dx)}x{abs(self.total_dy)}px")
-
-        self.status_var.set("우하단 코너 지정 완료!")
-        self.guide_var.set("파란 마커(좌상단) ~ 빨간 마커(우하단) 확인\n\n"
-                           "맞으면 [촬영 시작!]\n"
-                           "틀리면 [위치 다시 잡기]")
-        self.btn_start.config(state="normal")
-        self.btn_reset.config(state="normal")
-        self.state = "bottom_right_set"
-
-    # ============================================================
     # 위치 다시 잡기
     # ============================================================
     def _on_reset(self):
-        asyncio.get_event_loop().run_until_complete(self._reset_overlay())
-
-        self.status_var.set("위치를 다시 잡아주세요")
-        self.guide_var.set("화면 좌상단 코너에 시작점을 맞추고\n[좌상단 코너 지정]")
-        self.btn_top_left.config(state="normal")
-        self.btn_bottom_right.config(state="disabled")
+        self.status_var.set("좌표 초기화됨")
+        self.bounds = {'top': None, 'bottom': None, 'left': None, 'right': None}
+        self._update_bound_status()
         self.btn_start.config(state="disabled")
-        self.btn_reset.config(state="disabled")
-        self.state = "init"
-        self.log("위치 초기화")
+        self.btn_top.config(state="normal")
+        self.btn_bottom.config(state="normal")
+        self.btn_left.config(state="normal")
+        self.btn_right.config(state="normal")
+        self.guide_var.set("지도를 드래그하여 경계를 화면 가장자리에 맞추고 버튼을 누르세요")
+        self.log("경계 초기화")
+
+        # 브라우저 경계선 숨기기
+        if self.page:
+            asyncio.get_event_loop().run_until_complete(self._reset_overlay())
+
+        # 미니맵 리셋
+        self.canvas.delete("all")
+        self.canvas.create_text(325, 300, text="브라우저를 열어주세요", fill="#9ca3af", font=("Segoe UI", 11))
+        self.overview_img = None
 
     async def _reset_overlay(self):
         await self.page.evaluate("""
-            // 좌상단 코너 초기화
-            const tl = document.getElementById('__corner_tl');
-            tl.style.display = 'block';
-            tl.querySelector('div:last-child').textContent = '좌상단';
-            tl.querySelector('div:last-child').style.background = 'rgba(255,0,0,0.9)';
-
-            // 나머지 숨기기
-            document.getElementById('__corner_br').style.display = 'none';
-            document.getElementById('__mark_tl_dot').style.display = 'none';
-            document.getElementById('__area_rect').style.display = 'none';
-
+            // 경계선 숨기기
+            ['top','bottom','left','right'].forEach(edge => {
+                document.getElementById('__edge_' + edge).style.display = 'none';
+                document.getElementById('__edge_label_' + edge).style.display = 'none';
+            });
             const guide = document.getElementById('__guide_label');
-            guide.textContent = '화면 좌상단 코너에 시작점을 맞추세요';
-            guide.style.background = 'rgba(0,0,0,0.8)';
+            guide.style.display = 'block';
+            guide.textContent = '각 경계선을 화면 가장자리에 맞추고 버튼을 누르세요';
+            guide.style.background = 'rgba(0,0,0,0.85)';
         """)
+
+    def _update_mini_map_image(self, screenshot_bytes):
+        """캡처한 스크린샷을 미니맵 캔버스에 표시"""
+        img = Image.open(io.BytesIO(screenshot_bytes))
+        self.overview_img = img
+        
+        # 비율 유지하며 리사이즈
+        w, h = img.size
+        ratio = min(self.canvas_width / w, self.canvas_height / h)
+        new_w, new_h = int(w * ratio), int(h * ratio)
+        img_resized = img.resize((new_w, new_h), Image.Resampling.LANCZOS)
+        
+        self.overview_photo = ImageTk.PhotoImage(img_resized)
+        self.canvas.delete("all")
+        self.canvas.create_image(0, 0, anchor="nw", image=self.overview_photo)
+        self.mini_scale = ratio # 실시간 표시를 위한 스케일 저장
+
+    def _update_minimap_merged(self, merged_path):
+        """병합 중간 결과를 미니맵에 표시"""
+        try:
+            img = Image.open(merged_path)
+            w, h = img.size
+            ratio = min(self.canvas_width / w, self.canvas_height / h)
+            new_w, new_h = int(w * ratio), int(h * ratio)
+            img_resized = img.resize((new_w, new_h), Image.Resampling.LANCZOS)
+
+            self.overview_photo = ImageTk.PhotoImage(img_resized)
+            self.canvas.delete("all")
+            self.canvas.create_image(0, 0, anchor="nw", image=self.overview_photo)
+            self.root.update_idletasks()
+        except Exception:
+            pass
 
     # ============================================================
     # 촬영 중지
@@ -480,8 +729,10 @@ class App:
         self.stop_requested = False
         self.btn_start.config(state="disabled")
         self.btn_reset.config(state="disabled")
-        self.btn_top_left.config(state="disabled")
-        self.btn_bottom_right.config(state="disabled")
+        self.btn_top.config(state="disabled")
+        self.btn_bottom.config(state="disabled")
+        self.btn_left.config(state="disabled")
+        self.btn_right.config(state="disabled")
         self.btn_stop.config(state="normal")
         self.state = "running"
         asyncio.get_event_loop().run_until_complete(self._run_download())
@@ -489,44 +740,78 @@ class App:
     async def _run_download(self):
         page = self.page
 
-        # 오버레이 제거
+        # 오버레이 가이드 숨기기
         await page.evaluate("""
-            document.getElementById('__corner_tl').style.display = 'none';
-            document.getElementById('__corner_br').style.display = 'none';
-            document.getElementById('__mark_tl_dot').style.display = 'none';
-            document.getElementById('__area_rect').style.display = 'none';
-            document.getElementById('__guide_label').style.display = 'none';
+            document.getElementById('__map_overlay').style.display = 'none';
         """)
 
-        # 1) 우하단 → 좌상단으로 복귀 (축소 상태에서)
-        self.status_var.set("좌상단으로 복귀 중...")
-        self.root.update()
-        self.log("좌상단으로 복귀 중...")
-        await drag_map(page, -abs(self.total_dx), -abs(self.total_dy))
+        # 0) 현재 위치 확인
+        cur_dx = await self.page.evaluate("window.__totalDragX")
+        cur_dy = await self.page.evaluate("window.__totalDragY")
+
+        # 뷰포트 크기
+        vp = page.viewport_size
+        half_w = vp["width"] // 2
+        half_h = vp["height"] // 2
+
+        # 1) 경계값을 화면 가장자리 기준으로 보정
+        # 경계 지정 시 드래그 누적값은 "화면 중앙" 기준이지만,
+        # 실제 경계는 화면 가장자리에 맞췄으므로 뷰포트 절반만큼 보정
+        edge_top = self.bounds['top'] - half_h
+        edge_bottom = self.bounds['bottom'] + half_h
+        edge_left = self.bounds['left'] - half_w
+        edge_right = self.bounds['right'] + half_w
+
+        left = min(edge_left, edge_right)
+        right = max(edge_left, edge_right)
+        top = min(edge_top, edge_bottom)
+        bottom = max(edge_top, edge_bottom)
+
+        width_px = right - left
+        height_px = bottom - top
+
+        # 2) 촬영 시작점(좌상단)으로 이동
+        # 첫 촬영의 화면 중앙이 (left + half_w, top + half_h)에 와야 함
+        target_x = left + half_w
+        target_y = top + half_h
+        self.status_var.set("좌상단 시작점으로 이동 중...")
+        self.log(f"영역 크기: {width_px}x{height_px}px")
+
+        dist_x = target_x - cur_dx
+        dist_y = target_y - cur_dy
+        await drag_map(page, dist_x, dist_y)
         await asyncio.sleep(config.PAN_WAIT)
 
-        # 2) 최대 확대 (좌상단 코너 기준으로 확대됨)
+        # 3) 미니맵용 전체 샷 찍기
+        screenshot_bytes = await self.page.screenshot()
+        self._update_mini_map_image(screenshot_bytes)
+
+        # 4) 최대 확대
         self.status_var.set("최대 확대 중...")
-        self.root.update()
-        self.log("최대 확대 중...")
         zoom_ratio = await zoom_to_max(page, log_fn=self.log)
 
-        # 3) 격자 계산
-        vp = page.viewport_size
-        usable_w = vp["width"] - 140
-        usable_h = vp["height"] - 130
+        # 5) 격자 계산 (전체 뷰포트 사용 — 다운로드 이미지는 전체 화면)
+        usable_w = vp["width"]
+        usable_h = vp["height"]
 
         step_x = int(usable_w * (1 - config.OVERLAP_RATIO))
         step_y = int(usable_h * (1 - config.OVERLAP_RATIO))
 
-        cols = math.ceil(abs(self.total_dx) * zoom_ratio / step_x) + 1
-        rows = math.ceil(abs(self.total_dy) * zoom_ratio / step_y) + 1
+        total_w = int(width_px * zoom_ratio)
+        total_h = int(height_px * zoom_ratio)
+
+        cols = max(1, math.ceil((total_w - usable_w) / step_x) + 1)
+        rows = max(1, math.ceil((total_h - usable_h) / step_y) + 1)
         total = rows * cols
 
-        self.log(f"확대 후 전체 영역: {abs(self.total_dx) * zoom_ratio:.0f}x{abs(self.total_dy) * zoom_ratio:.0f}px")
+        self.log(f"확대 후 전체 영역: {total_w}x{total_h}px")
         self.log(f"격자: {rows}행 x {cols}열 = {total}장")
 
-        # 4) 촬영 시작 (좌상단 코너에서 바로 시작 — 보정 불필요)
+        # 3.5) 병합기 초기화
+        stitcher = MapStitcher(rows, cols, usable_w, usable_h, step_x, step_y)
+        merged_path = os.path.join(self.download_path, "_merged_result.jpg")
+
+        # 4) 촬영 시작
         self.status_var.set(f"촬영 중... (0/{total})")
         self.root.update()
 
@@ -535,21 +820,29 @@ class App:
 
         for row in range(rows):
             for col in range(cols):
-                idx = row * cols + col + 1
-                self.progress_var.set(f"[{idx}/{total}] row={row}, col={col}")
-                self.status_var.set(f"촬영 중... ({idx}/{total})")
-                self.root.update()
-
                 if self.stop_requested:
                     self.log(f"=== {success}장 다운로드 후 중지됨 ===")
                     self.status_var.set(f"중지됨! {success}장 다운로드됨")
                     self.btn_stop.config(state="disabled")
                     self.btn_reset.config(state="normal")
                     return
+                
+                idx = row * cols + col + 1
+                self.progress_var.set(f"[{idx}/{total}] row={row}, col={col}")
+                self.status_var.set(f"촬영 중... ({idx}/{total})")
+                self.root.update()
 
                 if await click_download(page):
                     success += 1
                     self.log(f"[{idx}/{total}] 다운로드 성공")
+                    
+                    # 실시간 병합
+                    img_name = f"map_{idx:03d}.png"
+                    img_path = os.path.join(self.download_path, img_name)
+                    if os.path.exists(img_path):
+                        stitcher.add_tile(row, col, direction, img_path)
+                        stitcher.save(merged_path)
+                        self._update_minimap_merged(merged_path)
                 else:
                     self.log(f"[{idx}/{total}] 다운로드 실패!")
 
@@ -562,6 +855,10 @@ class App:
             if row < rows - 1:
                 await drag_map(page, 0, step_y)
                 direction *= -1
+
+        # 최종 저장
+        stitcher.save(merged_path)
+        self.log(f"=== 최종 병합 완료: _merged_result.jpg ===")
 
         self.status_var.set(f"완료! {success}/{total}장 다운로드됨")
         self.progress_var.set(f"저장 경로: {self.download_path}")

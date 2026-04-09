@@ -25,7 +25,7 @@ GRID_ROWS = 4
 GRID_COLS = 3
 
 # 뷰포트 이동 시 오버랩 비율 (0.1 = 10%)
-OVERLAP_RATIO = 0.1
+OVERLAP_RATIO = 0.2
 
 # 다운로드 파일 저장 경로
 DOWNLOAD_DIR = "./downloads"

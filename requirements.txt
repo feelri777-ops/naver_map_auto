@@ -1,2 +1,4 @@
 playwright==1.49.1
 pillow==11.1.0
+opencv-python==4.10.0.84
+numpy==2.0.2
