@@ -7,16 +7,19 @@
   3. 자동으로 최대 확대 → 좌상단 복귀 → 격자 촬영
 """
 
-import asyncio
 import os
+import sys
+
+# macOS Tkinter 호환성 개선을 위한 환경 변수
+os.environ['TK_SILENCE_DEPRECATION'] = '1'
+
+import asyncio
 import math
 import re
 import tkinter as tk
 from tkinter import messagebox, ttk
 from PIL import Image, ImageTk
 import io
-import cv2
-import numpy as np
 from playwright.async_api import async_playwright
 import config
 
@@ -114,194 +117,6 @@ async def click_download(page):
 
 
 # ============================================================
-# 이미지 병합 클래스 (OpenCV 템플릿 매칭 정밀 정렬)
-# ============================================================
-class MapStitcher:
-    def __init__(self, rows, cols, tile_w, tile_h, step_x, step_y):
-        self.rows = rows
-        self.cols = cols
-        self.tile_w = int(tile_w)
-        self.tile_h = int(tile_h)
-        self.step_x = int(step_x)
-        self.step_y = int(step_y)
-
-        # 타일별 실제 배치 좌표 (정밀 정렬 후 갱신)
-        self.positions = {}  # (row, col) -> (x, y)
-        # 타일 이미지 캐시
-        self.tiles = {}  # (row, col) -> numpy array
-
-    def _find_offset(self, base_img, new_img, direction):
-        """
-        템플릿 매칭으로 두 이미지 간 정확한 오프셋을 찾는다.
-        direction: 'h' (가로 인접) 또는 'v' (세로 인접)
-        """
-        gray_base = cv2.cvtColor(base_img, cv2.COLOR_BGR2GRAY)
-        gray_new = cv2.cvtColor(new_img, cv2.COLOR_BGR2GRAY)
-
-        h_b, w_b = gray_base.shape
-        h_n, w_n = gray_new.shape
-
-        if direction == 'h':
-            # 가로: base 우측 겹침 영역 vs new 좌측 영역
-            overlap_est = w_b - self.step_x
-            margin = max(50, overlap_est // 3)
-            overlap_min = max(10, overlap_est - margin)
-            overlap_max = min(w_b, w_n, overlap_est + margin)
-
-            # base 우측에서 탐색 템플릿 추출
-            tmpl_w = max(10, overlap_min // 2)
-            tmpl_x = w_b - overlap_est
-            # 세로 중앙 부분만 사용 (노이즈 줄이기)
-            cy = h_b // 2
-            tmpl_h = min(h_b // 3, 200)
-            ty1 = cy - tmpl_h // 2
-            ty2 = ty1 + tmpl_h
-
-            template = gray_base[ty1:ty2, tmpl_x:tmpl_x + tmpl_w]
-            if template.size == 0:
-                return self.step_x, 0
-
-            # new 이미지 좌측 검색 영역
-            search_w = min(overlap_max + margin, w_n)
-            search = gray_new[ty1:ty2, 0:search_w]
-            if search.shape[1] <= template.shape[1] or search.shape[0] <= template.shape[0]:
-                return self.step_x, 0
-
-            res = cv2.matchTemplate(search, template, cv2.TM_CCOEFF_NORMED)
-            _, max_val, _, max_loc = cv2.minMaxLoc(res)
-
-            if max_val > 0.5:
-                # new 이미지에서 템플릿이 발견된 x 위치
-                match_x_in_new = max_loc[0]
-                # base에서 템플릿 시작 x = tmpl_x
-                # 따라서 실제 수평 오프셋 = w_b - tmpl_x + match_x_in_new... 아니라
-                # base의 tmpl_x 위치와 new의 match_x가 같은 지도 위치
-                # offset_x = w_b - (tmpl_x - 0) - (match_x_in_new - 0) = w_b - tmpl_x + ...
-                # 더 단순하게: base 원점 기준 tmpl_x, new 원점 기준 match_x가 같은 점
-                # new의 원점 = base 원점 + offset_x → offset_x = tmpl_x - match_x_in_new
-                dx = tmpl_x - match_x_in_new
-                return dx, 0
-            return self.step_x, 0
-
-        else:
-            # 세로: base 하단 겹침 영역 vs new 상단 영역
-            overlap_est = h_b - self.step_y
-            margin = max(50, overlap_est // 3)
-            overlap_min = max(10, overlap_est - margin)
-            overlap_max = min(h_b, h_n, overlap_est + margin)
-
-            tmpl_h = max(10, overlap_min // 2)
-            tmpl_y = h_b - overlap_est
-            cx = w_b // 2
-            tmpl_w = min(w_b // 3, 200)
-            tx1 = cx - tmpl_w // 2
-            tx2 = tx1 + tmpl_w
-
-            template = gray_base[tmpl_y:tmpl_y + tmpl_h, tx1:tx2]
-            if template.size == 0:
-                return 0, self.step_y
-
-            search_h = min(overlap_max + margin, h_n)
-            search = gray_new[0:search_h, tx1:tx2]
-            if search.shape[0] <= template.shape[0] or search.shape[1] <= template.shape[1]:
-                return 0, self.step_y
-
-            res = cv2.matchTemplate(search, template, cv2.TM_CCOEFF_NORMED)
-            _, max_val, _, max_loc = cv2.minMaxLoc(res)
-
-            if max_val > 0.5:
-                match_y_in_new = max_loc[1]
-                dy = tmpl_y - match_y_in_new
-                return 0, dy
-            return 0, self.step_y
-
-    def add_tile(self, row, col_idx, direction, img_path):
-        img = cv2.imread(img_path)
-        if img is None:
-            return
-
-        # 스네이크 패턴에 따른 실제 그리드 좌표
-        if direction == 1:
-            col = col_idx
-        else:
-            col = (self.cols - 1) - col_idx
-
-        self.tiles[(row, col)] = img
-
-        # 첫 타일
-        if not self.positions:
-            self.positions[(row, col)] = (0, 0)
-            return
-
-        # 가로 인접 타일과 매칭
-        if (row, col - 1) in self.positions and (row, col - 1) in self.tiles:
-            base = self.tiles[(row, col - 1)]
-            bx, by = self.positions[(row, col - 1)]
-            dx, dy = self._find_offset(base, img, 'h')
-            self.positions[(row, col)] = (bx + dx, by + dy)
-        elif (row, col + 1) in self.positions and (row, col + 1) in self.tiles:
-            base = self.tiles[(row, col + 1)]
-            bx, by = self.positions[(row, col + 1)]
-            dx, dy = self._find_offset(base, img, 'h')
-            self.positions[(row, col)] = (bx - dx, by - dy)
-        # 세로 인접 타일과 매칭
-        elif (row - 1, col) in self.positions and (row - 1, col) in self.tiles:
-            base = self.tiles[(row - 1, col)]
-            bx, by = self.positions[(row - 1, col)]
-            dx, dy = self._find_offset(base, img, 'v')
-            self.positions[(row, col)] = (bx + dx, by + dy)
-        else:
-            # 폴백: 예상 위치 사용
-            self.positions[(row, col)] = (col * self.step_x, row * self.step_y)
-
-        # 행의 첫 타일이면서 위쪽 행이 있으면, 세로 정렬 보정
-        if col_idx == 0 and row > 0:
-            above_col = col
-            if (row - 1, above_col) in self.positions and (row - 1, above_col) in self.tiles:
-                base = self.tiles[(row - 1, above_col)]
-                bx, by = self.positions[(row - 1, above_col)]
-                dx, dy = self._find_offset(base, img, 'v')
-                self.positions[(row, col)] = (bx + dx, by + dy)
-
-    def save(self, path):
-        if not self.positions:
-            return
-
-        # 모든 위치의 최소값 계산 (음수 좌표 보정)
-        min_x = min(p[0] for p in self.positions.values())
-        min_y = min(p[1] for p in self.positions.values())
-
-        # 캔버스 크기 계산
-        max_x = 0
-        max_y = 0
-        for (r, c), (px, py) in self.positions.items():
-            if (r, c) in self.tiles:
-                h, w = self.tiles[(r, c)].shape[:2]
-                max_x = max(max_x, px - min_x + w)
-                max_y = max(max_y, py - min_y + h)
-
-        canvas = np.zeros((int(max_y), int(max_x), 3), dtype=np.uint8)
-        canvas.fill(240)
-
-        # 뒤에서부터 그려서 먼저 배치된 타일이 위에 오도록
-        sorted_keys = sorted(self.positions.keys(), key=lambda k: (k[0], k[1]), reverse=True)
-        for (r, c) in sorted_keys:
-            if (r, c) not in self.tiles:
-                continue
-            img = self.tiles[(r, c)]
-            px = int(self.positions[(r, c)][0] - min_x)
-            py = int(self.positions[(r, c)][1] - min_y)
-            h, w = img.shape[:2]
-
-            y_end = min(py + h, canvas.shape[0])
-            x_end = min(px + w, canvas.shape[1])
-            if py < 0 or px < 0:
-                continue
-            canvas[py:y_end, px:x_end] = img[0:y_end - py, 0:x_end - px]
-
-        cv2.imwrite(path, canvas)
-
-
 # ============================================================
 # 오버레이 JS
 # ============================================================
@@ -392,6 +207,13 @@ class App:
 
         self._build_ui()
 
+        # macOS 백지 현상 방지를 위한 강제 업데이트
+        try:
+            self.root.update_idletasks()
+            self.root.update()
+        except Exception:
+            pass
+
     def _build_ui(self):
         # 라이트 테마 색상
         self.bg_color = "#f5f5f7"
@@ -407,40 +229,47 @@ class App:
 
         # ttk 스타일 설정
         style = ttk.Style()
-        style.theme_use("clam")
+        try:
+            # macOS 시스템 테마와 충돌을 최소화하기 위해 clam 또는 alt 사용 시도
+            if sys.platform == "darwin":
+                style.theme_use("alt") 
+            else:
+                style.theme_use("clam")
+        except Exception:
+            pass
 
         style.configure("Title.TLabel", background=self.bg_color, foreground=self.accent_color,
-                         font=("Segoe UI", 15, "bold"))
+                         font=("Helvetica", 15, "bold"))
         style.configure("Guide.TLabel", background=self.bg_color, foreground=self.secondary_text,
-                         font=("Segoe UI", 9))
+                         font=("Helvetica", 9))
         style.configure("Status.TLabel", background=self.panel_color, foreground=self.secondary_text,
-                         font=("Consolas", 9))
+                         font=("Monaco", 9))
         style.configure("Progress.TLabel", background=self.bg_color, foreground=self.text_color,
-                         font=("Segoe UI", 9))
+                         font=("Helvetica", 9))
 
-        style.configure("Primary.TButton", font=("Segoe UI", 9), padding=(12, 8))
+        style.configure("Primary.TButton", font=("Helvetica", 9), padding=(12, 8))
         style.map("Primary.TButton",
                    background=[("active", "#1d4ed8"), ("!disabled", self.accent_color), ("disabled", "#d1d5db")],
                    foreground=[("!disabled", "white"), ("disabled", "#9ca3af")])
 
-        style.configure("Green.TButton", font=("Segoe UI", 10, "bold"), padding=(12, 10))
+        style.configure("Green.TButton", font=("Helvetica", 10, "bold"), padding=(12, 10))
         style.map("Green.TButton",
                    background=[("active", "#15803d"), ("!disabled", self.green), ("disabled", "#d1d5db")],
                    foreground=[("!disabled", "white"), ("disabled", "#9ca3af")])
 
-        style.configure("Red.TButton", font=("Segoe UI", 9), padding=(12, 8))
+        style.configure("Red.TButton", font=("Helvetica", 9), padding=(12, 8))
         style.map("Red.TButton",
                    background=[("active", "#b91c1c"), ("!disabled", self.red), ("disabled", "#d1d5db")],
                    foreground=[("!disabled", "white"), ("disabled", "#9ca3af")])
 
-        style.configure("Edge.TButton", font=("Segoe UI", 9), padding=(8, 6))
+        style.configure("Edge.TButton", font=("Helvetica", 9), padding=(8, 6))
         style.map("Edge.TButton",
                    background=[("active", "#e0e7ff"), ("!disabled", "#eef2ff"), ("disabled", "#f3f4f6")],
                    foreground=[("!disabled", "#3730a3"), ("disabled", "#9ca3af")])
 
         style.configure("Card.TLabelframe", background=self.panel_color, relief="solid", borderwidth=1)
         style.configure("Card.TLabelframe.Label", background=self.panel_color, foreground=self.accent_color,
-                         font=("Segoe UI", 9, "bold"))
+                         font=("Helvetica", 9, "bold"))
 
         # 전체 레이아웃
         main_frame = tk.Frame(self.root, bg=self.bg_color)
@@ -537,8 +366,20 @@ class App:
                                  borderwidth=0, padx=8, pady=6, selectbackground="#bfdbfe")
         self.log_text.pack(fill="both", expand=True)
 
+    def _get_loop(self):
+        try:
+            loop = asyncio.get_event_loop()
+            if loop.is_closed():
+                raise RuntimeError
+            return loop
+        except RuntimeError:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            return loop
+
     def log(self, msg):
-        self.log_text.insert(tk.END, f"[{asyncio.get_event_loop().time():.1f}] {msg}\n")
+        if not self.log_text.winfo_exists(): return
+        self.log_text.insert(tk.END, f"[{self._get_loop().time():.1f}] {msg}\n")
         self.log_text.see(tk.END)
         self.root.update()
 
@@ -549,7 +390,7 @@ class App:
         self.btn_open.config(state="disabled")
         self.status_var.set("브라우저 여는 중...")
         self.root.update()
-        asyncio.get_event_loop().run_until_complete(self._open_browser())
+        self._get_loop().run_until_complete(self._open_browser())
 
     async def _open_browser(self):
         download_path = os.path.abspath(config.DOWNLOAD_DIR)
@@ -580,7 +421,7 @@ class App:
 
         self.page.on("download", handle_download)
 
-        await self.page.goto("https://map.naver.com/", wait_until="networkidle")
+        await self.page.goto("https://map.naver.com/", wait_until="domcontentloaded")
         await asyncio.sleep(2)
 
         # 오버레이 주입
@@ -608,7 +449,7 @@ class App:
 
     def _on_set_edge(self, edge):
         if not self.page: return
-        asyncio.get_event_loop().run_until_complete(self._capture_edge(edge))
+        self._get_loop().run_until_complete(self._capture_edge(edge))
 
     async def _capture_edge(self, edge):
         dx = await self.page.evaluate("window.__totalDragX")
@@ -642,7 +483,7 @@ class App:
 
     def _toggle_naver_ui(self):
         if self.page:
-            asyncio.get_event_loop().run_until_complete(self.page.evaluate("window.__toggleNaverUI()"))
+            self._get_loop().run_until_complete(self.page.evaluate("window.__toggleNaverUI()"))
 
     # ============================================================
     # 위치 다시 잡기
@@ -661,7 +502,7 @@ class App:
 
         # 브라우저 경계선 숨기기
         if self.page:
-            asyncio.get_event_loop().run_until_complete(self._reset_overlay())
+            self._get_loop().run_until_complete(self._reset_overlay())
 
         # 미니맵 리셋
         self.canvas.delete("all")
@@ -697,22 +538,6 @@ class App:
         self.canvas.create_image(0, 0, anchor="nw", image=self.overview_photo)
         self.mini_scale = ratio # 실시간 표시를 위한 스케일 저장
 
-    def _update_minimap_merged(self, merged_path):
-        """병합 중간 결과를 미니맵에 표시"""
-        try:
-            img = Image.open(merged_path)
-            w, h = img.size
-            ratio = min(self.canvas_width / w, self.canvas_height / h)
-            new_w, new_h = int(w * ratio), int(h * ratio)
-            img_resized = img.resize((new_w, new_h), Image.Resampling.LANCZOS)
-
-            self.overview_photo = ImageTk.PhotoImage(img_resized)
-            self.canvas.delete("all")
-            self.canvas.create_image(0, 0, anchor="nw", image=self.overview_photo)
-            self.root.update_idletasks()
-        except Exception:
-            pass
-
     # ============================================================
     # 촬영 중지
     # ============================================================
@@ -735,7 +560,7 @@ class App:
         self.btn_right.config(state="disabled")
         self.btn_stop.config(state="normal")
         self.state = "running"
-        asyncio.get_event_loop().run_until_complete(self._run_download())
+        self._get_loop().run_until_complete(self._run_download())
 
     async def _run_download(self):
         page = self.page
@@ -807,10 +632,6 @@ class App:
         self.log(f"확대 후 전체 영역: {total_w}x{total_h}px")
         self.log(f"격자: {rows}행 x {cols}열 = {total}장")
 
-        # 3.5) 병합기 초기화
-        stitcher = MapStitcher(rows, cols, usable_w, usable_h, step_x, step_y)
-        merged_path = os.path.join(self.download_path, "_merged_result.jpg")
-
         # 4) 촬영 시작
         self.status_var.set(f"촬영 중... (0/{total})")
         self.root.update()
@@ -835,14 +656,6 @@ class App:
                 if await click_download(page):
                     success += 1
                     self.log(f"[{idx}/{total}] 다운로드 성공")
-                    
-                    # 실시간 병합
-                    img_name = f"map_{idx:03d}.png"
-                    img_path = os.path.join(self.download_path, img_name)
-                    if os.path.exists(img_path):
-                        stitcher.add_tile(row, col, direction, img_path)
-                        stitcher.save(merged_path)
-                        self._update_minimap_merged(merged_path)
                 else:
                     self.log(f"[{idx}/{total}] 다운로드 실패!")
 
@@ -855,10 +668,6 @@ class App:
             if row < rows - 1:
                 await drag_map(page, 0, step_y)
                 direction *= -1
-
-        # 최종 저장
-        stitcher.save(merged_path)
-        self.log(f"=== 최종 병합 완료: _merged_result.jpg ===")
 
         self.status_var.set(f"완료! {success}/{total}장 다운로드됨")
         self.progress_var.set(f"저장 경로: {self.download_path}")
