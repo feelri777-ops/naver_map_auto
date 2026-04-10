@@ -17,9 +17,12 @@ import config
 
 async def main():
     async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=False)
+        browser = await p.chromium.launch(
+            headless=False,
+            args=["--start-maximized"] # 창 최대화 시작
+        )
         context = await browser.new_context(
-            viewport={"width": 1400, "height": 900},
+            viewport={"width": config.VIEWPORT_WIDTH, "height": config.VIEWPORT_HEIGHT},
             locale="ko-KR",
         )
         page = await context.new_page()

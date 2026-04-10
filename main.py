@@ -9,51 +9,83 @@
 
 import os
 import sys
-
-# macOS Tkinter 호환성 개선을 위한 환경 변수
-os.environ['TK_SILENCE_DEPRECATION'] = '1'
-
 import asyncio
 import math
 import re
+import io
+import threading
 import tkinter as tk
 from tkinter import messagebox, ttk
 from PIL import Image, ImageTk
-import io
 from playwright.async_api import async_playwright
 import config
 
+# macOS Tkinter 호환성 개선
+os.environ['TK_SILENCE_DEPRECATION'] = '1'
 
-def get_zoom_from_url(url):
-    """URL에서 줌 레벨을 추출한다."""
-    match = re.search(r'[?&]c=([0-9.]+)', url)
-    if match:
-        return float(match.group(1))
-    return None
+
+def get_map_state(url):
+    """
+    URL에서 (longitude, latitude, zoom, floor)를 추출한다.
+    일반 지도: ?c=127.1058092,37.3595953,17,0,0,0,dh&f=B1  (7개 파트)
+    실내 지도: ?c=20.00,0,0,0,dh                            (5개 파트, 줌만)
+    """
+    state = {"lng": None, "lat": None, "zoom": None, "floor": None}
+    if not url: return state
+
+    c_match = re.search(r'[?&]c=([^&]+)', url)
+    if c_match:
+        parts = c_match.group(1).split(',')
+        try:
+            if len(parts) >= 7:
+                # 일반 지도: lng, lat, zoom, ...
+                state["lng"] = float(parts[0])
+                state["lat"] = float(parts[1])
+                state["zoom"] = float(parts[2])
+            elif len(parts) >= 1:
+                # 실내 지도: zoom, tilt, bearing, 0, dh
+                state["zoom"] = float(parts[0])
+        except ValueError:
+            pass
+
+    f_match = re.search(r'[?&]f=([^&]+)', url)
+    if f_match:
+        state["floor"] = f_match.group(1)
+
+    return state
 
 
 async def drag_map(page, dx, dy):
-    """마우스 드래그로 맵을 이동한다."""
-    vp = page.viewport_size
-    cx = vp["width"] // 2
-    cy = vp["height"] // 2
+    """마우스 드래그로 맵을 지정된 CSS 픽셀만큼 상대적으로 이동한다."""
+    if abs(dx) < 0.5 and abs(dy) < 0.5: return # 미세 이동은 무시
 
+    # DPR을 반영한 지도 영역 중앙 (CSS 픽셀)
+    dpr = await page.evaluate("window.devicePixelRatio || 1")
+    cx = 63 / dpr + (1857 / dpr) / 2
+    cy = (1080 / dpr) / 2
+
+    # 이동 시작 전 현재 위치 고정
     await page.mouse.move(cx, cy)
     await page.mouse.down()
-    steps = 10
+    
+    # 지도의 관성을 방지하기 위해 단계를 나누어 부드럽게 이동
+    steps = 20
     for i in range(1, steps + 1):
         await page.mouse.move(
             cx - int(dx * i / steps),
             cy - int(dy * i / steps),
         )
-        await asyncio.sleep(0.05)
+        await asyncio.sleep(0.01) # 짧은 주기로 정밀 제어
+    
     await page.mouse.up()
+    # 지도가 완전히 멈출 때까지 대기
     await asyncio.sleep(config.PAN_WAIT)
 
 
 async def zoom_to_max(page, log_fn=None):
     """줌 버튼을 반복 클릭해서 최대 확대. 줌 비율 반환."""
-    before_zoom = get_zoom_from_url(page.url)
+    state_before = get_map_state(page.url)
+    before_zoom = state_before["zoom"]
 
     zoom_selectors = [
         "button[aria-label='확대']",
@@ -74,18 +106,27 @@ async def zoom_to_max(page, log_fn=None):
     if zoom_btn:
         for _ in range(30):
             try:
+                s_curr = get_map_state(page.url)
                 await zoom_btn.click()
                 await asyncio.sleep(0.4)
+                s_new = get_map_state(page.url)
+                if s_curr["zoom"] and s_new["zoom"] and s_new["zoom"] <= s_curr["zoom"]:
+                    break
             except Exception:
                 break
-        await asyncio.sleep(2)
+        await asyncio.sleep(1)
     else:
         for _ in range(30):
+            s_curr = get_map_state(page.url)
             await page.mouse.wheel(0, -300)
             await asyncio.sleep(0.3)
-        await asyncio.sleep(2)
+            s_new = get_map_state(page.url)
+            if s_curr["zoom"] and s_new["zoom"] and s_new["zoom"] <= s_curr["zoom"]:
+                break
+        await asyncio.sleep(1)
 
-    after_zoom = get_zoom_from_url(page.url)
+    state_after = get_map_state(page.url)
+    after_zoom = state_after["zoom"]
 
     if before_zoom and after_zoom:
         if after_zoom > before_zoom:
@@ -121,63 +162,267 @@ async def click_download(page):
 # 오버레이 JS
 # ============================================================
 OVERLAY_JS = """
-const overlay = document.createElement('div');
-overlay.id = '__map_overlay';
-overlay.innerHTML = `
-    <!-- 경계선 표시 (상/하/좌/우) -->
-    <div id="__edge_top" style="position:fixed; left:0; top:0; width:100%; height:3px; background:#00ff88; z-index:99998; pointer-events:none; display:none; box-shadow:0 0 8px #00ff88;"></div>
-    <div id="__edge_bottom" style="position:fixed; left:0; bottom:0; width:100%; height:3px; background:#00ff88; z-index:99998; pointer-events:none; display:none; box-shadow:0 0 8px #00ff88;"></div>
-    <div id="__edge_left" style="position:fixed; left:0; top:0; width:3px; height:100%; background:#00ff88; z-index:99998; pointer-events:none; display:none; box-shadow:0 0 8px #00ff88;"></div>
-    <div id="__edge_right" style="position:fixed; right:0; top:0; width:3px; height:100%; background:#00ff88; z-index:99998; pointer-events:none; display:none; box-shadow:0 0 8px #00ff88;"></div>
+(function() {
+    // 사용자 실측 기반 정밀 가이드 (왼쪽 메뉴바 63px 고정 후 1857x1080 영역)
+    window.__getMapRect = function() {
+        const dpr = window.devicePixelRatio || 1;
+        
+        // 1:1 매칭을 위해 실계산된 물리 해상도를 CSS 픽셀로 변환
+        return { 
+            left: 63 / dpr,      // 왼쪽 메뉴바폭 63px 고정
+            top: 0,              // 상단 0 고정
+            width: 1857 / dpr,   // 가로 1857px 고정
+            height: 1080 / dpr   // 세로 1080px 고정
+        };
+    };
 
-    <!-- 경계선 라벨 -->
-    <div id="__edge_label_top" style="position:fixed; left:50%; top:6px; transform:translateX(-50%); background:#00ff88; color:#000; padding:2px 10px; border-radius:4px; font-size:12px; font-weight:bold; z-index:99999; pointer-events:none; display:none;">▲ 상단</div>
-    <div id="__edge_label_bottom" style="position:fixed; left:50%; bottom:6px; transform:translateX(-50%); background:#00ff88; color:#000; padding:2px 10px; border-radius:4px; font-size:12px; font-weight:bold; z-index:99999; pointer-events:none; display:none;">▼ 하단</div>
-    <div id="__edge_label_left" style="position:fixed; left:6px; top:50%; transform:translateY(-50%); background:#00ff88; color:#000; padding:2px 10px; border-radius:4px; font-size:12px; font-weight:bold; z-index:99999; pointer-events:none; display:none;">◀ 좌측</div>
-    <div id="__edge_label_right" style="position:fixed; right:6px; top:50%; transform:translateY(-50%); background:#00ff88; color:#000; padding:2px 10px; border-radius:4px; font-size:12px; font-weight:bold; z-index:99999; pointer-events:none; display:none;">▶ 우측</div>
-
-    <!-- 안내 라벨 -->
-    <div id="__guide_label" style="position:fixed; left:50%; top:20px; transform:translateX(-50%);
-        background:rgba(0,0,0,0.85); color:white; padding:12px 24px; border-radius:30px;
-        font-size:16px; font-weight:bold; z-index:99999; pointer-events:none; display:none;
-        white-space:nowrap; border: 2px solid #ff4444;"></div>
-`;
-document.body.appendChild(overlay);
-
-window.__totalDragX = 0;
-window.__totalDragY = 0;
-window.__tracking = true;
-
-document.addEventListener('mousedown', (e) => {
-    window.__lastX = e.clientX;
-    window.__lastY = e.clientY;
-});
-
-document.addEventListener('mouseup', (e) => {
-    if (window.__tracking) {
-        window.__totalDragX += (window.__lastX - e.clientX);
-        window.__totalDragY += (window.__lastY - e.clientY);
-    }
-});
-
-// 네이버 지도 UI 요소 숨기기/보이기
-window.__toggleNaverUI = function() {
-    let style = document.getElementById('__naver_ui_hider');
-    if (style) {
-        style.remove();
-    } else {
-        style = document.createElement('style');
-        style.id = '__naver_ui_hider';
-        style.innerHTML = `
-            #header, .search_area,
-            .control_container, .copyright_container,
-            .entrance_container, .map_logo {
-                display: none !important;
+    window.__updateOverlayPosition = function() {
+        const r = window.__getMapRect();
+        const lines = document.getElementById('__naver_overlay_lines');
+        if (lines) {
+            lines.style.top = r.top + 'px';
+            lines.style.left = r.left + 'px';
+            lines.style.width = r.width + 'px';
+            lines.style.height = r.height + 'px';
+            
+            const dpr = window.devicePixelRatio || 1;
+            const w = Math.round(r.width * dpr);
+            const h = Math.round(r.height * dpr);
+            const label = document.getElementById('__guide_label');
+            if (label) {
+                label.innerHTML = `<b>경계 지정 모드 (실제 캡처 크기: ${w} x ${h})</b><br>빨간색 사각형 안에 촬영할 건물 경계를 맞추세요.`;
             }
-        `;
-        document.head.appendChild(style);
-    }
-};
+        }
+    };
+
+    // --- 고정 경계선 (지도와 함께 이동하는 디버깅용 선) ---
+    window.__boundaryPoints = { top: null, bottom: null, left: null, right: null };
+    
+    window.__setBoundaryLine = function(edge) {
+        const dpr = window.devicePixelRatio || 1;
+        const r = window.__getMapRect();
+        
+        window.__boundaryPoints[edge] = {
+            dragX: window.__totalDragX,
+            dragY: window.__totalDragY,
+            screenX: (edge === 'left') ? r.left : (edge === 'right' ? r.left + r.width : 0),
+            screenY: (edge === 'top') ? r.top : (edge === 'bottom' ? r.top + r.height : 0)
+        };
+        
+        let el = document.getElementById('__boundary_line_' + edge);
+        if (!el) {
+            el = document.createElement('div');
+            el.id = '__boundary_line_' + edge;
+            el.style.position = 'fixed';
+            el.style.pointerEvents = 'none';
+            el.style.zIndex = '999998';
+            el.style.backgroundColor = '#007aff';
+            el.style.boxShadow = '0 0 5px rgba(0,122,255,0.5)';
+            document.body.appendChild(el);
+        }
+        el.style.display = 'block';
+        window.__updateBoundaryPositions();
+    };
+
+    window.__updateBoundaryPositions = function() {
+        for (let edge in window.__boundaryPoints) {
+            const pt = window.__boundaryPoints[edge];
+            if (!pt) continue;
+            const el = document.getElementById('__boundary_line_' + edge);
+            if (!el) continue;
+            const dx = window.__totalDragX - pt.dragX;
+            const dy = window.__totalDragY - pt.dragY;
+            if (edge === 'left' || edge === 'right') {
+                el.style.width = '2px';
+                el.style.height = '100vh';
+                el.style.top = '0';
+                el.style.left = (pt.screenX - dx) + 'px';
+            } else {
+                el.style.height = '2px';
+                el.style.width = '100vw';
+                el.style.left = '0';
+                el.style.top = (pt.screenY - dy) + 'px';
+            }
+        }
+    };
+
+    // --- 촬영 격자 (반투명 박스 및 번호) ---
+    window.__gridCells = [];
+    
+    window.__drawGrid = function(rows, cols, xOffsets, yOffsets) {
+        window.__gridCells.forEach(c => {
+            const el = document.getElementById('__grid_cell_' + c.id);
+            if (el) el.remove();
+        });
+        window.__gridCells = [];
+        
+        const r = window.__getMapRect();
+        const dpr = window.devicePixelRatio || 1;
+        const tileW = 1857 / dpr;
+        const tileH = 1080 / dpr;
+        
+        // 1번 타일의 중심점(Center)이 화면상에 위치해야 할 현재 스크린 좌표 계산
+        // LEFT(X)와 TOP(Y) 경계를 각각 기준으로 하여 초기 중심점 좌표를 역산함
+        const leftPt = window.__boundaryPoints['left'];
+        const topPt  = window.__boundaryPoints['top'];
+        
+        if (!leftPt || !topPt) return;
+
+        // 기준점: 경계 지정 당시의 맵 중심이 현재 화면 어디에 있는지 계산
+        const baseCenterX = (r.left + r.width/2) - (window.__totalDragX - leftPt.dragX);
+        const baseCenterY = (r.top + r.height/2) - (window.__totalDragY - topPt.dragY);
+        
+        for (let row = 0; row < rows; row++) {
+            for (let col = 0; col < cols; col++) {
+                const id = row * cols + col + 1;
+                const el = document.createElement('div');
+                el.id = '__grid_cell_' + id;
+                el.style.position = 'fixed';
+                el.style.pointerEvents = 'none';
+                el.style.zIndex = '999997';
+                el.style.border = '1px dashed rgba(255,255,255,0.4)';
+                el.style.backgroundColor = 'rgba(0, 122, 255, 0.15)';
+                
+                // [리팩토링 핵심 1] 테두리 두께로 인한 오차 방지
+                el.style.boxSizing = 'border-box';
+                
+                el.style.display = 'flex';
+                el.style.alignItems = 'center';
+                el.style.justifyContent = 'center';
+                el.style.color = 'white';
+                el.style.fontWeight = 'bold';
+                el.style.fontSize = '24px';
+                el.style.textShadow = '0 0 4px black';
+                el.textContent = id;
+                
+                // Python에서 넘어온 Center 기준 오프셋
+                const xOffset = xOffsets[col];
+                const yOffset = yOffsets[row];
+                
+                // [리팩토링 핵심 2] Center 좌표를 CSS Top-Left로 변환 (절반 크기 보정)
+                const left = baseCenterX + xOffset - (tileH / 2); // 가로 세로 혼동 주의: 여기서는 tileW
+                const top = baseCenterY + yOffset - (tileH / 2);
+                
+                // 보정된 tileW 사용
+                el.style.width = tileW + 'px';
+                el.style.height = tileH + 'px';
+                el.style.left = (baseCenterX + xOffset - (tileW / 2)) + 'px';
+                el.style.top = (baseCenterY + yOffset - (tileH / 2)) + 'px';
+                
+                document.body.appendChild(el);
+                window.__gridCells.push({
+                    id: id, 
+                    dragX: window.__totalDragX, 
+                    dragY: window.__totalDragY,
+                    initialLeft: parseFloat(el.style.left), 
+                    initialTop: parseFloat(el.style.top)
+                });
+            }
+        }
+    };
+
+    window.__updateGridPositions = function() {
+        window.__gridCells.forEach(cell => {
+            const el = document.getElementById('__grid_cell_' + cell.id);
+            if (el) {
+                const dx = window.__totalDragX - cell.dragX;
+                const dy = window.__totalDragY - cell.dragY;
+                el.style.left = (cell.initialLeft - dx) + 'px';
+                el.style.top = (cell.initialTop - dy) + 'px';
+            }
+        });
+    };
+
+    window.__highlightGrid = function(activeId) {
+        window.__gridCells.forEach(cell => {
+            const el = document.getElementById('__grid_cell_' + cell.id);
+            if (el) {
+                if (cell.id === activeId) {
+                    el.style.backgroundColor = 'rgba(255, 235, 59, 0.3)';
+                    el.style.border = '3px solid #ffeb3b';
+                } else if (cell.id < activeId) {
+                    el.style.backgroundColor = 'rgba(76, 175, 80, 0.05)';
+                    el.style.border = '1px solid rgba(255,255,255,0.1)';
+                } else {
+                    el.style.backgroundColor = 'rgba(0, 122, 255, 0.1)';
+                    el.style.border = '1px dashed rgba(255,255,255,0.3)';
+                }
+            }
+        });
+    };
+
+    window.__toggleNaverUI = function() {
+        let style = document.getElementById('__naver_ui_hider');
+        if (style) { style.remove(); } else {
+            style = document.createElement('style');
+            style.id = '__naver_ui_hider';
+            style.innerHTML = `#header, .search_area, .control_container, .copyright_container, .entrance_container, .map_logo, .list_bubble_keyword, [class*="StyledBubbleKeywordArea"] { display: none !important; }`;
+            document.head.appendChild(style);
+        }
+    };
+
+    window.__getEdgePos = function(edge) {
+        const r = window.__getMapRect();
+        let screenX = 0, screenY = 0;
+        if (edge === 'left') screenX = r.left;
+        else if (edge === 'right') screenX = r.left + r.width;
+        else if (edge === 'top') screenY = r.top;
+        else if (edge === 'bottom') screenY = r.top + r.height;
+
+        return {
+            dragX: window.__totalDragX,
+            dragY: window.__totalDragY,
+            screenX: screenX,
+            screenY: screenY
+        };
+    };
+
+    const overlay = document.createElement('div');
+    overlay.id = '__naver_overlay';
+    overlay.innerHTML = `
+        <div id="__naver_overlay_lines" style="position:fixed; pointer-events:none; z-index:999999; border:3px solid #ff4444; opacity:0.7; box-sizing:border-box;"></div>
+        <div id="__guide_label" style="position:fixed; bottom:20px; left:50%; transform:translateX(-50%);
+                    background:rgba(0,0,0,0.85); color:white; padding:12px 24px;
+                    border-radius:30px; font-size:14px; pointer-events:none; z-index:999999;
+                    box-shadow: 0 4px 15px rgba(0,0,0,0.5); text-align:center;">
+            지도가 보이는 영역의 끝에 건물 경계를 맞추세요.
+        </div>
+    `;
+    document.body.appendChild(overlay);
+    
+    setInterval(() => {
+        window.__updateOverlayPosition();
+        window.__updateBoundaryPositions();
+        window.__updateGridPositions();
+    }, 30);
+
+    // 좌표 정보 및 드래그 추적
+    window.__totalDragX = 0;
+    window.__totalDragY = 0;
+    window.__lastX = 0;
+    window.__lastY = 0;
+    window.__tracking = false;
+
+    document.addEventListener('mousedown', (e) => {
+        window.__tracking = true;
+        window.__lastX = e.clientX;
+        window.__lastY = e.clientY;
+    });
+
+    document.addEventListener('mousemove', (e) => {
+        if (window.__tracking) {
+            window.__totalDragX += (window.__lastX - e.clientX);
+            window.__totalDragY += (window.__lastY - e.clientY);
+            window.__lastX = e.clientX;
+            window.__lastY = e.clientY;
+        }
+    });
+
+    document.addEventListener('mouseup', () => {
+        window.__tracking = false;
+
+    });
+})();
 """
 
 
@@ -192,8 +437,13 @@ class App:
         self.context = None
         self.pw = None
         
-        # 신규 4방향 경계값
-        self.bounds = {'top': None, 'bottom': None, 'left': None, 'right': None}
+        # 신규 4방향 정밀 경계 데이터 (경위도 및 드래그 기록 포함)
+        self.bounds = {
+            'top': None,    # {'lat': val, 'y': dragY}
+            'bottom': None, # {'lat': val, 'y': dragY}
+            'left': None,   # {'lng': val, 'x': dragX}
+            'right': None   # {'lng': val, 'x': dragX}
+        }
         
         self.state = "init"
         self.stop_requested = False
@@ -204,6 +454,10 @@ class App:
         self.canvas_width = 900
         self.canvas_height = 800
         self.rect_id = None
+
+        # 썸네일 캐시
+        self.thumb_photos = {} # {edge: PhotoImage}
+        self.thumb_canvases = {} # {edge: Canvas}
 
         self._build_ui()
 
@@ -309,7 +563,7 @@ class App:
         self.btn_open.pack(side="left", padx=(0, 6), fill="x", expand=True)
 
         self.btn_toggle_ui = ttk.Button(step1, text="UI 숨김/표시", style="Primary.TButton",
-                                         command=self._toggle_naver_ui, state="disabled")
+                                         command=self._on_naver_ui_toggle, state="disabled")
         self.btn_toggle_ui.pack(side="left", fill="x", expand=True)
 
         # 2. 경계 지정 카드
@@ -337,6 +591,27 @@ class App:
 
         self.bound_status_var = tk.StringVar(value="T: -  |  B: -  |  L: -  |  R: -")
         ttk.Label(boundary_frame, textvariable=self.bound_status_var, style="Status.TLabel").pack()
+
+        # --- 썸네일 4개 격자 추가 ---
+        self.thumb_frame = tk.Frame(boundary_frame, bg=self.panel_color)
+        self.thumb_frame.pack(fill="x", pady=(10, 0))
+
+        edges = [('top', '상단 ↑'), ('bottom', '하단 ↓'), ('left', '좌측 ←'), ('right', '우측 →')]
+        for i, (key, label) in enumerate(edges):
+            r, c = i // 2, i % 2
+            cell = tk.Frame(self.thumb_frame, bg=self.panel_color)
+            cell.grid(row=r, column=c, sticky="nsew", padx=2, pady=2)
+            
+            tk.Label(cell, text=label, font=("Helvetica", 8), bg=self.panel_color, fg=self.secondary_text).pack()
+            
+            canvas = tk.Canvas(cell, width=160, height=100, bg="#f3f4f6", 
+                               highlightthickness=1, highlightbackground=self.border_color)
+            canvas.pack()
+            self.thumb_canvases[key] = canvas
+            canvas.create_text(80, 50, text="-", fill="#d1d5db")
+
+        self.thumb_frame.columnconfigure(0, weight=1)
+        self.thumb_frame.columnconfigure(1, weight=1)
 
         # 3. 촬영 / 초기화
         action_frame = tk.Frame(left_frame, bg=self.bg_color)
@@ -367,21 +642,34 @@ class App:
         self.log_text.pack(fill="both", expand=True)
 
     def _get_loop(self):
-        try:
-            loop = asyncio.get_event_loop()
-            if loop.is_closed():
-                raise RuntimeError
-            return loop
-        except RuntimeError:
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-            return loop
+        """백그라운드 스레드에서 관리되는 이벤트 루프 반환"""
+        if not hasattr(self, 'loop'):
+            self.loop = asyncio.new_event_loop()
+            threading.Thread(target=self._run_async_loop, daemon=True).start()
+        return self.loop
+
+    def _run_async_loop(self):
+        """별도 스레드에서 무한 루프 실행"""
+        asyncio.set_event_loop(self.loop)
+        self.loop.run_forever()
+
+    def _run_coro(self, coro):
+        """코루틴을 백그라운드 루프에 안전하게 등록 (예외 시 로그 출력)"""
+        future = asyncio.run_coroutine_threadsafe(coro, self._get_loop())
+        def _on_done(f):
+            exc = f.exception()
+            if exc:
+                self.root.after(0, lambda: self.log(f"오류: {exc}"))
+        future.add_done_callback(_on_done)
+        return future
 
     def log(self, msg):
+        """스레드 안전한 로그 기록 (tk.after 사용)"""
         if not self.log_text.winfo_exists(): return
-        self.log_text.insert(tk.END, f"[{self._get_loop().time():.1f}] {msg}\n")
-        self.log_text.see(tk.END)
-        self.root.update()
+        def _append():
+            self.log_text.insert(tk.END, f"[{self.loop.time():.1f}] {msg}\n")
+            self.log_text.see(tk.END)
+        self.root.after(0, _append)
 
     # ============================================================
     # 1. 브라우저 열기
@@ -389,8 +677,7 @@ class App:
     def _on_open_browser(self):
         self.btn_open.config(state="disabled")
         self.status_var.set("브라우저 여는 중...")
-        self.root.update()
-        self._get_loop().run_until_complete(self._open_browser())
+        self._run_coro(self._open_browser())
 
     async def _open_browser(self):
         download_path = os.path.abspath(config.DOWNLOAD_DIR)
@@ -402,7 +689,15 @@ class App:
         self.context = await self.pw.chromium.launch_persistent_context(
             user_data_dir,
             headless=False,
-            viewport={"width": 1400, "height": 900},
+            viewport={"width": 1920, "height": 1080},
+            args=[
+                "--start-maximized", 
+                "--disable-infobars",
+                "--disable-blink-features=AutomationControlled",
+                "--no-sandbox",
+                "--disable-dev-shm-usage"
+            ],
+            ignore_default_args=["enable-automation"],
             locale="ko-KR",
             accept_downloads=True,
             downloads_path=download_path,
@@ -431,11 +726,11 @@ class App:
         await self.page.evaluate("""
             const guide = document.getElementById('__guide_label');
             guide.style.display = 'block';
-            guide.textContent = '각 경계선을 화면 가장자리에 맞추고 버튼을 누르세요';
+            guide.innerHTML = '<b>경계 지정 모드</b><br>화면 끝에 건물 경계가 오도록 맞추고 버튼을 누르세요';
         """)
 
         self.status_var.set("브라우저 준비 완료!")
-        self.guide_var.set("지도를 드래그하여 경계를 화면 가장자리에 맞추고 버튼을 누르세요")
+        self.guide_var.set("화면 끝에 건물 경계가 오도록 맞추고 해당 방향 버튼을 누르세요")
         
         # 버튼 활성화
         self.btn_top.config(state="normal")
@@ -449,60 +744,151 @@ class App:
 
     def _on_set_edge(self, edge):
         if not self.page: return
-        self._get_loop().run_until_complete(self._capture_edge(edge))
+        self._run_coro(self._capture_edge(edge))
 
     async def _capture_edge(self, edge):
+        # 관성 이동이 멈출 때까지 잠시 대기
+        await asyncio.sleep(0.5)
+
+        # 모든 좌표를 CSS 픽셀 단위로 통일 (DPR 변환 없음)
         dx = await self.page.evaluate("window.__totalDragX")
         dy = await self.page.evaluate("window.__totalDragY")
+        rect = await self.page.evaluate("window.__getMapRect()")
 
-        if edge == 'top': self.bounds['top'] = dy
-        elif edge == 'bottom': self.bounds['bottom'] = dy
-        elif edge == 'left': self.bounds['left'] = dx
-        elif edge == 'right': self.bounds['right'] = dx
+        # CSS 픽셀 기준 맵 영역 크기
+        map_w = rect['width']   # 1857/dpr
+        map_h = rect['height']  # 1080/dpr
+        half_w = map_w / 2
+        half_h = map_h / 2
 
-        # 브라우저에 경계선 표시
-        await self.page.evaluate(f"""
-            document.getElementById('__edge_{edge}').style.display = 'block';
-            document.getElementById('__edge_label_{edge}').style.display = 'block';
-        """)
+        # center = 해당 경계를 지정할 때의 totalDrag (화면 중심의 절대 위치)
+        # edge = 화면 끝단의 절대 위치 (center ± 맵 반폭/반높이)
+        if edge == 'top':
+            self.bounds[edge] = {'center': dy, 'edge': dy - half_h}
+        elif edge == 'bottom':
+            self.bounds[edge] = {'center': dy, 'edge': dy + half_h}
+        elif edge == 'left':
+            self.bounds[edge] = {'center': dx, 'edge': dx - half_w}
+        elif edge == 'right':
+            self.bounds[edge] = {'center': dx, 'edge': dx + half_w}
 
-        self._update_bound_status()
-        self.log(f"{edge.upper()} 경계 지정됨: {dx if edge in ['left','right'] else dy}px")
+        # 미니맵 및 해당 썸네일 업데이트
+        screenshot_bytes = await self.page.screenshot()
+        self._ui(lambda: self._update_mini_map_image(screenshot_bytes, edge))
+
+        # 시각적 경계선 추가 (브라우저 내에 파란색 실선 표시)
+        await self.page.evaluate(f"window.__setBoundaryLine('{edge}')")
+
+        self._ui(lambda: self._update_bound_status())
+        self.log(f"{edge.upper()} 경계 지정됨 (화면 끝 기준)")
+
+        # 모든 경계가 지정되었다면 격자 미리보기 생성
+        if all(v is not None for v in self.bounds.values()):
+            # bounds는 모두 CSS 픽셀 단위
+            rect = await self.page.evaluate("window.__getMapRect()")
+            map_w_css = rect['width']
+            map_h_css = rect['height']
+
+            dist_x = abs(self.bounds['right']['edge'] - self.bounds['left']['edge'])
+            dist_y = abs(self.bounds['bottom']['edge'] - self.bounds['top']['edge'])
+
+            # Helper 메서드를 이용해 균등 격자 설정 최적 계산
+            cols, x_coords, x_step = self._get_grid_config(
+                dist_x, map_w_css, self.bounds['left']['center'], self.bounds['right']['center']
+            )
+            rows, y_coords, y_step = self._get_grid_config(
+                dist_y, map_h_css, self.bounds['top']['center'], self.bounds['bottom']['center']
+            )
+
+            # JS에 전달할 때는 반올림된 오프셋 사용 (시작 center 기준 상대 좌표)
+            x_offsets = [round(c - self.bounds['left']['center'], 2) for c in x_coords]
+            y_offsets = [round(c - self.bounds['top']['center'], 2) for c in y_coords]
+
+            await self.page.evaluate(f"window.__drawGrid({rows}, {cols}, {x_offsets}, {y_offsets})")
+            self.log(f"격자 생성: {rows}행 x {cols}열 (균등 오버랩 배정 완료)")
 
         # 4개 다 설정되었으면 촬영 시작 버튼 활성화
         if all(v is not None for v in self.bounds.values()):
-            self.btn_start.config(state="normal")
-            self.guide_var.set("영역 지정 완료! [3. 촬영 시작]을 누르세요")
+            self._ui(lambda: self.btn_start.config(state="normal"))
+            self._ui(lambda: self.guide_var.set("경계 설정 완료! [촬영 시작]을 누르세요"))
+
+    def _get_grid_config(self, total_area_dist, map_size, start_center, end_center):
+        """균등 오버랩 배치를 위한 타일 개수 및 정밀 좌표 리스트를 산출한다."""
+        import math
+        max_step = map_size * 0.8
+        # 최소 필요한 타일 수 계산
+        count = math.ceil((total_area_dist - map_size) / max_step) + 1 if total_area_dist > map_size else 1
+        
+        # 시작 중심점부터 끝 중심점까지의 총 이동 거리
+        move_dist = end_center - start_center
+        # 실제 적용될 균등 간격 (Overlap 보장)
+        step = move_dist / (count - 1) if count > 1 else 0
+        # 순회할 모든 피봇(Center) 좌표 생성
+        coords = [start_center + (step * i) for i in range(count)]
+        
+        # 부동소수점 오차 보정: 마지막 좌표를 end_center에 강제 스냅
+        if count > 1:
+            coords[-1] = end_center
+        
+        return count, coords, step
 
     def _update_bound_status(self):
-        t = f"{self.bounds['top']}" if self.bounds['top'] is not None else "-"
-        b = f"{self.bounds['bottom']}" if self.bounds['bottom'] is not None else "-"
-        l = f"{self.bounds['left']}" if self.bounds['left'] is not None else "-"
-        r = f"{self.bounds['right']}" if self.bounds['right'] is not None else "-"
-        self.bound_status_var.set(f"T: {t} | B: {b} | L: {l} | R: {r}")
+        def _fmt(b):
+            # 중심점(center) 좌표를 출력하도록 수정
+            return f"({b['center']:.0f})" if b else "-"
+        self.bound_status_var.set(
+            f"T: {_fmt(self.bounds['top'])} | B: {_fmt(self.bounds['bottom'])} | "
+            f"L: {_fmt(self.bounds['left'])} | R: {_fmt(self.bounds['right'])}"
+        )
 
-    def _toggle_naver_ui(self):
+    # 층 정보 토글
+    def _on_naver_ui_toggle(self):
         if self.page:
-            self._get_loop().run_until_complete(self.page.evaluate("window.__toggleNaverUI()"))
+            self._run_coro(self.page.evaluate("window.__toggleNaverUI()"))
+
+    async def _drag_long(self, page, dx, dy):
+        """장거리 드래그를 여러 조각으로 나누어 안전하게 수행한다."""
+        max_step = 500 # 한 번에 드래그할 최대 픽셀
+        rem_x = dx
+        rem_y = dy
+        
+        while abs(rem_x) > 1 or abs(rem_y) > 1:
+            step_x = max(-max_step, min(max_step, rem_x))
+            step_y = max(-max_step, min(max_step, rem_y))
+            
+            # drag_map은 전역 함수이므로 그대로 호출
+            await drag_map(page, step_x, step_y)
+            
+            rem_x -= step_x
+            rem_y -= step_y
+            await asyncio.sleep(0.1)
 
     # ============================================================
     # 위치 다시 잡기
     # ============================================================
     def _on_reset(self):
-        self.status_var.set("좌표 초기화됨")
-        self.bounds = {'top': None, 'bottom': None, 'left': None, 'right': None}
-        self._update_bound_status()
-        self.btn_start.config(state="disabled")
+        """모든 경계 데이터 및 썸네일 초기화"""
+        for k in self.bounds: self.bounds[k] = None
+        self.bound_status_var.set("T: -  |  B: -  |  L: -  |  R: -")
+        self.log("경계 정보를 모두 초기화했습니다.")
+        
+        # 썸네일 초기화
+        for key, canvas in self.thumb_canvases.items():
+            canvas.delete("all")
+            canvas.create_text(80, 50, text="-", fill="#d1d5db")
+        self.thumb_photos.clear()
+        
+        # 촬영 시작 버튼 비활성화
+        self.btn_start.configure(state="disabled")
+        if self.page:
+            self._run_coro(self._reset_overlay())
+        self.log("초기화됨")
         self.btn_top.config(state="normal")
         self.btn_bottom.config(state="normal")
         self.btn_left.config(state="normal")
         self.btn_right.config(state="normal")
-        self.guide_var.set("지도를 드래그하여 경계를 화면 가장자리에 맞추고 버튼을 누르세요")
+        self.guide_var.set("화면 끝에 건물 경계가 오도록 맞추고 해당 방향 버튼을 누르세요")
         self.log("경계 초기화")
-
-        # 브라우저 경계선 숨기기
-        if self.page:
-            self._get_loop().run_until_complete(self._reset_overlay())
 
         # 미니맵 리셋
         self.canvas.delete("all")
@@ -511,32 +897,68 @@ class App:
 
     async def _reset_overlay(self):
         await self.page.evaluate("""
-            // 경계선 숨기기
+            // 경계선 및 텍스트 숨기기
             ['top','bottom','left','right'].forEach(edge => {
-                document.getElementById('__edge_' + edge).style.display = 'none';
-                document.getElementById('__edge_label_' + edge).style.display = 'none';
+                const guide = document.getElementById('__edge_' + edge);
+                if (guide) guide.style.display = 'none';
+                const label = document.getElementById('__edge_label_' + edge);
+                if (label) label.style.display = 'none';
+                
+                // 파란색 시각적 경계선 숨기기
+                const line = document.getElementById('__boundary_line_' + edge);
+                if (line) line.style.display = 'none';
+                window.__boundaryPoints[edge] = null;
             });
             const guide = document.getElementById('__guide_label');
-            guide.style.display = 'block';
-            guide.textContent = '각 경계선을 화면 가장자리에 맞추고 버튼을 누르세요';
-            guide.style.background = 'rgba(0,0,0,0.85)';
+            if (guide) {
+                guide.style.display = 'block';
+                guide.textContent = '각 경계선을 화면 가장자리에 맞추고 버튼을 누르세요';
+                guide.style.background = 'rgba(0,0,0,0.85)';
+            }
         """)
 
-    def _update_mini_map_image(self, screenshot_bytes):
-        """캡처한 스크린샷을 미니맵 캔버스에 표시"""
+    def _update_mini_map_image(self, screenshot_bytes, edge=None):
+        """미니맵 및 방향별 썸네일 업데이트"""
         img = Image.open(io.BytesIO(screenshot_bytes))
-        self.overview_img = img
-        
-        # 비율 유지하며 리사이즈
         w, h = img.size
-        ratio = min(self.canvas_width / w, self.canvas_height / h)
+
+        # 캔버스의 실제 표시 크기를 사용 (레이아웃 후 크기)
+        cw = self.canvas.winfo_width()
+        ch = self.canvas.winfo_height()
+        if cw < 10: cw = self.canvas_width
+        if ch < 10: ch = self.canvas_height
+
+        # 메인 미니맵 업데이트
+        ratio = min(cw / w, ch / h)
         new_w, new_h = int(w * ratio), int(h * ratio)
-        img_resized = img.resize((new_w, new_h), Image.Resampling.LANCZOS)
-        
-        self.overview_photo = ImageTk.PhotoImage(img_resized)
+        resized = img.resize((new_w, new_h), Image.Resampling.LANCZOS)
+
+        self.overview_img = img
+        self.overview_photo = ImageTk.PhotoImage(resized)
+
         self.canvas.delete("all")
-        self.canvas.create_image(0, 0, anchor="nw", image=self.overview_photo)
-        self.mini_scale = ratio # 실시간 표시를 위한 스케일 저장
+        self.canvas.create_image(cw // 2, ch // 2, anchor="center", image=self.overview_photo)
+
+        # 현재 촬영 완료된 모든 경계선 그리기 (미완성)
+        self._draw_bounds_on_canvas()
+
+        # 특정 방향 썸네일 업데이트
+        if edge and edge in self.thumb_canvases:
+            t_w, t_h = 160, 100
+            t_ratio = min(t_w / w, t_h / h)
+            t_new_w, t_new_h = int(w * t_ratio), int(h * t_ratio)
+            t_resized = img.resize((t_new_w, t_new_h), Image.Resampling.LANCZOS)
+            
+            photo = ImageTk.PhotoImage(t_resized)
+            self.thumb_photos[edge] = photo # 참조 유지
+            
+            canvas = self.thumb_canvases[edge]
+            canvas.delete("all")
+            canvas.create_image(t_w//2, t_h//2, anchor="center", image=photo)
+
+    def _draw_bounds_on_canvas(self):
+        # (기존 미니맵 위에 빨간 점이나 선을 그리는 로직 - 필요시 추가 가능)
+        pass
 
     # ============================================================
     # 촬영 중지
@@ -560,121 +982,121 @@ class App:
         self.btn_right.config(state="disabled")
         self.btn_stop.config(state="normal")
         self.state = "running"
-        self._get_loop().run_until_complete(self._run_download())
+        self._run_coro(self._run_download())
+
+    def _ui(self, fn):
+        """Tkinter 작업을 메인 스레드에서 안전하게 실행"""
+        self.root.after(0, fn)
 
     async def _run_download(self):
         page = self.page
 
-        # 오버레이 가이드 숨기기
-        await page.evaluate("""
-            document.getElementById('__map_overlay').style.display = 'none';
-        """)
+        try:
+            # 오버레이 가이드 숨기기
+            await page.evaluate("""
+                var el = document.getElementById('__naver_overlay');
+                if (el) el.style.display = 'none';
+            """)
 
-        # 0) 현재 위치 확인
-        cur_dx = await self.page.evaluate("window.__totalDragX")
-        cur_dy = await self.page.evaluate("window.__totalDragY")
+            # 1) 미니맵용 스크린샷 (현재 축소 상태에서)
+            screenshot_bytes = await page.screenshot()
+            self._ui(lambda: self._update_mini_map_image(screenshot_bytes))
 
-        # 뷰포트 크기
-        vp = page.viewport_size
-        half_w = vp["width"] // 2
-        half_h = vp["height"] // 2
+            # 2) 경계 간 물리 거리 계산 (미리 보정되어 저장된 경계값의 차이)
+            rect = await page.evaluate("window.__getMapRect()")
+            dpr = await page.evaluate("window.devicePixelRatio || 1")
+            m_w = rect['width'] * dpr
+            m_h = rect['height'] * dpr
 
-        # 1) 경계값을 화면 가장자리 기준으로 보정
-        # 경계 지정 시 드래그 누적값은 "화면 중앙" 기준이지만,
-        # 실제 경계는 화면 가장자리에 맞췄으므로 뷰포트 절반만큼 보정
-        edge_top = self.bounds['top'] - half_h
-        edge_bottom = self.bounds['bottom'] + half_h
-        edge_left = self.bounds['left'] - half_w
-        edge_right = self.bounds['right'] + half_w
+            # 모든 좌표는 CSS 픽셀 단위 (totalDragX/Y와 동일 단위)
+            dist_x = abs(self.bounds['right']['edge'] - self.bounds['left']['edge'])
+            dist_y = abs(self.bounds['bottom']['edge'] - self.bounds['top']['edge'])
+            self.log(f"전체 촬영 범위: {dist_x:.0f} x {dist_y:.0f} CSS px")
 
-        left = min(edge_left, edge_right)
-        right = max(edge_left, edge_right)
-        top = min(edge_top, edge_bottom)
-        bottom = max(edge_top, edge_bottom)
+            # 맵 영역 크기 (CSS 픽셀)
+            map_w_css = rect['width']   # 1857/dpr
+            map_h_css = rect['height']  # 1080/dpr
 
-        width_px = right - left
-        height_px = bottom - top
+            # 촬영 시작점 = LEFT center의 X좌표 + TOP center의 Y좌표
+            start_x = self.bounds['left']['center']
+            start_y = self.bounds['top']['center']
 
-        # 2) 촬영 시작점(좌상단)으로 이동
-        # 첫 촬영의 화면 중앙이 (left + half_w, top + half_h)에 와야 함
-        target_x = left + half_w
-        target_y = top + half_h
-        self.status_var.set("좌상단 시작점으로 이동 중...")
-        self.log(f"영역 크기: {width_px}x{height_px}px")
+            # 시작점으로 이동
+            cur_dx = await page.evaluate("window.__totalDragX")
+            cur_dy = await page.evaluate("window.__totalDragY")
+            gap_x = start_x - cur_dx
+            gap_y = start_y - cur_dy
 
-        dist_x = target_x - cur_dx
-        dist_y = target_y - cur_dy
-        await drag_map(page, dist_x, dist_y)
-        await asyncio.sleep(config.PAN_WAIT)
+            self.log(f"촬영 시작점 이동: dx={gap_x:.0f}px, dy={gap_y:.0f}px (CSS)")
+            await self._drag_long(page, gap_x, gap_y)
+            await asyncio.sleep(1)
 
-        # 3) 미니맵용 전체 샷 찍기
-        screenshot_bytes = await self.page.screenshot()
-        self._update_mini_map_image(screenshot_bytes)
+            # 격자 계산 및 균등 좌표 산출 (통합 Helper 사용)
+            cols, target_x_coords, x_step = self._get_grid_config(
+                dist_x, map_w_css, self.bounds['left']['center'], self.bounds['right']['center']
+            )
+            rows, target_y_coords, y_step = self._get_grid_config(
+                dist_y, map_h_css, self.bounds['top']['center'], self.bounds['bottom']['center']
+            )
+            total = rows * cols
 
-        # 4) 최대 확대
-        self.status_var.set("최대 확대 중...")
-        zoom_ratio = await zoom_to_max(page, log_fn=self.log)
+            self.log(f"격자: {rows}행 x {cols}열 = {total}장 (균등 배분 모드)")
+            self.log(f"평균 이동 간격: X={x_step:.1f}px, Y={y_step:.1f}px (Overlap: {((1 - abs(x_step)/map_w_css)*100 if map_w_css else 0):.1f}%)")
 
-        # 5) 격자 계산 (전체 뷰포트 사용 — 다운로드 이미지는 전체 화면)
-        usable_w = vp["width"]
-        usable_h = vp["height"]
+            # 격자 촬영 시작 (좌표 리스트 순회)
+            self._ui(lambda: self.status_var.set(f"촬영 중... (0/{total})"))
 
-        step_x = int(usable_w * (1 - config.OVERLAP_RATIO))
-        step_y = int(usable_h * (1 - config.OVERLAP_RATIO))
+            success = 0
 
-        total_w = int(width_px * zoom_ratio)
-        total_h = int(height_px * zoom_ratio)
+            for r_idx, target_y in enumerate(target_y_coords):
+                for c_idx, target_x in enumerate(target_x_coords):
+                    if self.stop_requested:
+                        self.log(f"=== {success}장 다운로드 후 중지됨 ===")
+                        self._ui(lambda: self.status_var.set(f"중지됨! {success}장 다운로드됨"))
+                        self._ui(lambda: self.btn_stop.config(state="disabled"))
+                        self._ui(lambda: self.btn_reset.config(state="normal"))
+                        return
 
-        cols = max(1, math.ceil((total_w - usable_w) / step_x) + 1)
-        rows = max(1, math.ceil((total_h - usable_h) / step_y) + 1)
-        total = rows * cols
+                    # 현재 위치 읽기 및 오차 보정 이동
+                    current_x = await page.evaluate("window.__totalDragX")
+                    current_y = await page.evaluate("window.__totalDragY")
+                    move_dx = target_x - current_x
+                    move_dy = target_y - current_y
 
-        self.log(f"확대 후 전체 영역: {total_w}x{total_h}px")
-        self.log(f"격자: {rows}행 x {cols}열 = {total}장")
+                    if abs(move_dx) > 0.5 or abs(move_dy) > 0.5:
+                        await drag_map(page, move_dx, move_dy)
+                        await asyncio.sleep(0.7) # 이동 후 타일 로딩 및 안정화 대기
 
-        # 4) 촬영 시작
-        self.status_var.set(f"촬영 중... (0/{total})")
-        self.root.update()
+                    # 촬영 UI 업데이트 및 브라우저 하이라이트
+                    idx = r_idx * cols + c_idx + 1
+                    await page.evaluate(f"window.__highlightGrid({idx})")
+                    
+                    self._ui(lambda i=idx: self.progress_var.set(f"[{i}/{total}] 행:{r_idx+1}, 열:{c_idx+1}"))
+                    self._ui(lambda i=idx: self.status_var.set(f"촬영 중... ({i}/{total})"))
 
-        success = 0
-        direction = 1
+                    # 실제 다운로드 실행
+                    if await click_download(page):
+                        success += 1
+                        self.log(f"[{idx}/{total}] 저장 성공 (X:{target_x:.0f}, Y:{target_y:.0f})")
+                    else:
+                        self.log(f"[{idx}/{total}] 저장 실패!")
+                        # 실패 시 재시도 로직을 넣거나 표시
 
-        for row in range(rows):
-            for col in range(cols):
-                if self.stop_requested:
-                    self.log(f"=== {success}장 다운로드 후 중지됨 ===")
-                    self.status_var.set(f"중지됨! {success}장 다운로드됨")
-                    self.btn_stop.config(state="disabled")
-                    self.btn_reset.config(state="normal")
-                    return
-                
-                idx = row * cols + col + 1
-                self.progress_var.set(f"[{idx}/{total}] row={row}, col={col}")
-                self.status_var.set(f"촬영 중... ({idx}/{total})")
-                self.root.update()
+            s = success
+            t = total
+            dp = self.download_path
+            self._ui(lambda: self.status_var.set(f"완료! {s}/{t}장 다운로드됨"))
+            self._ui(lambda: self.progress_var.set(f"저장 경로: {dp}"))
+            self._ui(lambda: self.btn_stop.config(state="disabled"))
+            self._ui(lambda: self.btn_reset.config(state="normal"))
+            self.log(f"=== 완료! {success}/{total}장 ===")
+            self._ui(lambda: messagebox.showinfo("완료", f"{s}/{t}장 다운로드 완료!\n\n저장 경로:\n{dp}"))
 
-                if await click_download(page):
-                    success += 1
-                    self.log(f"[{idx}/{total}] 다운로드 성공")
-                else:
-                    self.log(f"[{idx}/{total}] 다운로드 실패!")
-
-                self.root.update()
-
-                if col < cols - 1:
-                    dx = step_x * direction
-                    await drag_map(page, dx, 0)
-
-            if row < rows - 1:
-                await drag_map(page, 0, step_y)
-                direction *= -1
-
-        self.status_var.set(f"완료! {success}/{total}장 다운로드됨")
-        self.progress_var.set(f"저장 경로: {self.download_path}")
-        self.btn_stop.config(state="disabled")
-        self.btn_reset.config(state="normal")
-        self.log(f"=== 완료! {success}/{total}장 ===")
-        messagebox.showinfo("완료", f"{success}/{total}장 다운로드 완료!\n\n저장 경로:\n{self.download_path}")
+        except Exception as e:
+            self.log(f"촬영 오류: {e}")
+            self._ui(lambda: self.status_var.set("오류 발생! 로그를 확인하세요"))
+            self._ui(lambda: self.btn_stop.config(state="disabled"))
+            self._ui(lambda: self.btn_reset.config(state="normal"))
 
     def run(self):
         self.root.mainloop()
