@@ -40,24 +40,28 @@ async def main():
         print("=" * 60)
         input("\n완료 후 Enter...")
 
-        # 드래그 거리 추적용 JS 주입
+        # 드래그 거리 추적용 JS 주입 (절대 좌표 보정 적용)
         await page.evaluate("""
             window.__totalDragX = 0;
             window.__totalDragY = 0;
             window.__tracking = false;
-            window.__lastX = 0;
-            window.__lastY = 0;
+            window.__lastAbsX = 0;
+            window.__lastAbsY = 0;
 
             document.addEventListener('mousedown', (e) => {
                 if (window.__tracking) {
-                    window.__lastX = e.clientX;
-                    window.__lastY = e.clientY;
+                    // 뷰포트 (clientX) + 현재 스크롤(scrollX) = 문서 절대 좌표
+                    window.__lastAbsX = e.clientX + window.scrollX;
+                    window.__lastAbsY = e.clientY + window.scrollY;
                 }
             });
             document.addEventListener('mouseup', (e) => {
                 if (window.__tracking) {
-                    window.__totalDragX += (window.__lastX - e.clientX);
-                    window.__totalDragY += (window.__lastY - e.clientY);
+                    const currentAbsX = e.clientX + window.scrollX;
+                    const currentAbsY = e.clientY + window.scrollY;
+                    
+                    window.__totalDragX += (window.__lastAbsX - currentAbsX);
+                    window.__totalDragY += (window.__lastAbsY - currentAbsY);
                 }
             });
         """)

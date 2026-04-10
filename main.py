@@ -159,20 +159,42 @@ async def click_download(page):
 
 # ============================================================
 # ============================================================
-# 오버레이 JS
+# 오버레이 JS (절대 좌표계 개편 버전)
 # ============================================================
 OVERLAY_JS = """
 (function() {
-    // 사용자 실측 기반 정밀 가이드 (왼쪽 메뉴바 63px 고정 후 1857x1080 영역)
+    // 초기 스크롤 상태 저장
+    window.__initialScroll = { x: window.scrollX, y: window.scrollY };
+
+    // 스크롤 복원 함수
+    window.__restoreScroll = function() {
+        window.scrollTo({
+            left: window.__initialScroll.x,
+            top: window.__initialScroll.y,
+            behavior: 'instant'
+        });
+    };
+
+    // [개선] 지도가 렌더링되는 실제 컨테이너를 동적으로 탐색
+    window.__getMapElement = function() {
+        return document.getElementById('container') || 
+               document.querySelector('.map_viewer') || 
+               document.querySelector('[role="region"]') ||
+               document.body;
+    };
+
+    // [핵심] 문서 기준 절대 좌표 계산 (Scroll Offset 반영)
     window.__getMapRect = function() {
         const dpr = window.devicePixelRatio || 1;
+        const el = window.__getMapElement();
+        const rect = el.getBoundingClientRect();
         
-        // 1:1 매칭을 위해 실계산된 물리 해상도를 CSS 픽셀로 변환
+        // getBoundingClientRect는 뷰포트 상대좌표이므로 scrollY/X를 더해 절대좌표 산출
         return { 
-            left: 63 / dpr,      // 왼쪽 메뉴바폭 63px 고정
-            top: 0,              // 상단 0 고정
-            width: 1857 / dpr,   // 가로 1857px 고정
-            height: 1080 / dpr   // 세로 1080px 고정
+            left: rect.left + window.scrollX,
+            top: rect.top + window.scrollY,
+            width: rect.width,
+            height: rect.height
         };
     };
 
@@ -180,6 +202,7 @@ OVERLAY_JS = """
         const r = window.__getMapRect();
         const lines = document.getElementById('__naver_overlay_lines');
         if (lines) {
+            // position: absolute 이므로 문서 절대 좌표를 그대로 적용
             lines.style.top = r.top + 'px';
             lines.style.left = r.left + 'px';
             lines.style.width = r.width + 'px';
@@ -190,30 +213,29 @@ OVERLAY_JS = """
             const h = Math.round(r.height * dpr);
             const label = document.getElementById('__guide_label');
             if (label) {
-                label.innerHTML = `<b>경계 지정 모드 (실제 캡처 크기: ${w} x ${h})</b><br>빨간색 사각형 안에 촬영할 건물 경계를 맞추세요.`;
+                label.innerHTML = `<b>경계 지정 모드 (절대 좌표계)</b><br>캡처 영역: ${w} x ${h}<br>스크롤에 관계없이 위치가 고정됩니다.`;
             }
         }
     };
 
-    // --- 고정 경계선 (지도와 함께 이동하는 디버깅용 선) ---
+    // --- 고정 경계선 ---
     window.__boundaryPoints = { top: null, bottom: null, left: null, right: null };
     
     window.__setBoundaryLine = function(edge) {
-        const dpr = window.devicePixelRatio || 1;
         const r = window.__getMapRect();
         
         window.__boundaryPoints[edge] = {
             dragX: window.__totalDragX,
             dragY: window.__totalDragY,
-            screenX: (edge === 'left') ? r.left : (edge === 'right' ? r.left + r.width : 0),
-            screenY: (edge === 'top') ? r.top : (edge === 'bottom' ? r.top + r.height : 0)
+            absX: (edge === 'left') ? r.left : (edge === 'right' ? r.left + r.width : 0),
+            absY: (edge === 'top') ? r.top : (edge === 'bottom' ? r.top + r.height : 0)
         };
         
         let el = document.getElementById('__boundary_line_' + edge);
         if (!el) {
             el = document.createElement('div');
             el.id = '__boundary_line_' + edge;
-            el.style.position = 'fixed';
+            el.style.position = 'absolute'; // fixed -> absolute
             el.style.pointerEvents = 'none';
             el.style.zIndex = '999998';
             el.style.backgroundColor = '#007aff';
@@ -234,19 +256,19 @@ OVERLAY_JS = """
             const dy = window.__totalDragY - pt.dragY;
             if (edge === 'left' || edge === 'right') {
                 el.style.width = '2px';
-                el.style.height = '100vh';
+                el.style.height = document.documentElement.scrollHeight + 'px'; // 전체 길이
                 el.style.top = '0';
-                el.style.left = (pt.screenX - dx) + 'px';
+                el.style.left = (pt.absX - dx) + 'px';
             } else {
                 el.style.height = '2px';
-                el.style.width = '100vw';
+                el.style.width = document.documentElement.scrollWidth + 'px'; // 전체 너비
                 el.style.left = '0';
-                el.style.top = (pt.screenY - dy) + 'px';
+                el.style.top = (pt.absY - dy) + 'px';
             }
         }
     };
 
-    // --- 촬영 격자 (반투명 박스 및 번호) ---
+    // --- 촬영 격자 ---
     window.__gridCells = [];
     
     window.__drawGrid = function(rows, cols, xOffsets, yOffsets) {
@@ -258,17 +280,13 @@ OVERLAY_JS = """
         
         const r = window.__getMapRect();
         const dpr = window.devicePixelRatio || 1;
-        const tileW = 1857 / dpr;
-        const tileH = 1080 / dpr;
+        const tileW = r.width;
+        const tileH = r.height;
         
-        // 1번 타일의 중심점(Center)이 화면상에 위치해야 할 현재 스크린 좌표 계산
-        // LEFT(X)와 TOP(Y) 경계를 각각 기준으로 하여 초기 중심점 좌표를 역산함
         const leftPt = window.__boundaryPoints['left'];
         const topPt  = window.__boundaryPoints['top'];
-        
         if (!leftPt || !topPt) return;
 
-        // 기준점: 경계 지정 당시의 맵 중심이 현재 화면 어디에 있는지 계산
         const baseCenterX = (r.left + r.width/2) - (window.__totalDragX - leftPt.dragX);
         const baseCenterY = (r.top + r.height/2) - (window.__totalDragY - topPt.dragY);
         
@@ -277,15 +295,12 @@ OVERLAY_JS = """
                 const id = row * cols + col + 1;
                 const el = document.createElement('div');
                 el.id = '__grid_cell_' + id;
-                el.style.position = 'fixed';
+                el.style.position = 'absolute'; // fixed -> absolute
                 el.style.pointerEvents = 'none';
                 el.style.zIndex = '999997';
                 el.style.border = '1px dashed rgba(255,255,255,0.4)';
                 el.style.backgroundColor = 'rgba(0, 122, 255, 0.15)';
-                
-                // [리팩토링 핵심 1] 테두리 두께로 인한 오차 방지
                 el.style.boxSizing = 'border-box';
-                
                 el.style.display = 'flex';
                 el.style.alignItems = 'center';
                 el.style.justifyContent = 'center';
@@ -295,15 +310,9 @@ OVERLAY_JS = """
                 el.style.textShadow = '0 0 4px black';
                 el.textContent = id;
                 
-                // Python에서 넘어온 Center 기준 오프셋
                 const xOffset = xOffsets[col];
                 const yOffset = yOffsets[row];
                 
-                // [리팩토링 핵심 2] Center 좌표를 CSS Top-Left로 변환 (절반 크기 보정)
-                const left = baseCenterX + xOffset - (tileH / 2); // 가로 세로 혼동 주의: 여기서는 tileW
-                const top = baseCenterY + yOffset - (tileH / 2);
-                
-                // 보정된 tileW 사용
                 el.style.width = tileW + 'px';
                 el.style.height = tileH + 'px';
                 el.style.left = (baseCenterX + xOffset - (tileW / 2)) + 'px';
@@ -351,41 +360,31 @@ OVERLAY_JS = """
         });
     };
 
-    window.__toggleNaverUI = function() {
-        let style = document.getElementById('__naver_ui_hider');
-        if (style) { style.remove(); } else {
-            style = document.createElement('style');
-            style.id = '__naver_ui_hider';
-            style.innerHTML = `#header, .search_area, .control_container, .copyright_container, .entrance_container, .map_logo, .list_bubble_keyword, [class*="StyledBubbleKeywordArea"] { display: none !important; }`;
-            document.head.appendChild(style);
-        }
-    };
-
     window.__getEdgePos = function(edge) {
         const r = window.__getMapRect();
-        let screenX = 0, screenY = 0;
-        if (edge === 'left') screenX = r.left;
-        else if (edge === 'right') screenX = r.left + r.width;
-        else if (edge === 'top') screenY = r.top;
-        else if (edge === 'bottom') screenY = r.top + r.height;
+        let absX = 0, absY = 0;
+        if (edge === 'left') absX = r.left;
+        else if (edge === 'right') absX = r.left + r.width;
+        else if (edge === 'top') absY = r.top;
+        else if (edge === 'bottom') absY = r.top + r.height;
 
         return {
             dragX: window.__totalDragX,
             dragY: window.__totalDragY,
-            screenX: screenX,
-            screenY: screenY
+            absX: absX,
+            absY: absY
         };
     };
 
     const overlay = document.createElement('div');
     overlay.id = '__naver_overlay';
     overlay.innerHTML = `
-        <div id="__naver_overlay_lines" style="position:fixed; pointer-events:none; z-index:999999; border:3px solid #ff4444; opacity:0.7; box-sizing:border-box;"></div>
+        <div id="__naver_overlay_lines" style="position:absolute; pointer-events:none; z-index:999999; border:3px solid #ff4444; opacity:0.7; box-sizing:border-box;"></div>
         <div id="__guide_label" style="position:fixed; bottom:20px; left:50%; transform:translateX(-50%);
                     background:rgba(0,0,0,0.85); color:white; padding:12px 24px;
                     border-radius:30px; font-size:14px; pointer-events:none; z-index:999999;
                     box-shadow: 0 4px 15px rgba(0,0,0,0.5); text-align:center;">
-            지도가 보이는 영역의 끝에 건물 경계를 맞추세요.
+            <b>지보 정밀 좌표 모드</b><br>스크롤 보정 로직이 적용되었습니다.
         </div>
     `;
     document.body.appendChild(overlay);
@@ -420,7 +419,6 @@ OVERLAY_JS = """
 
     document.addEventListener('mouseup', () => {
         window.__tracking = false;
-
     });
 })();
 """
@@ -747,40 +745,40 @@ class App:
         self._run_coro(self._capture_edge(edge))
 
     async def _capture_edge(self, edge):
-        # 관성 이동이 멈출 때까지 잠시 대기
+        # [추가] 중요 좌표 캡처 전 스크롤 상태 강제 복원 (정밀도 확보)
+        await self.page.evaluate("if(window.__restoreScroll) window.__restoreScroll();")
         await asyncio.sleep(0.5)
 
         # 모든 좌표를 CSS 픽셀 단위로 통일 (DPR 변환 없음)
         dx = await self.page.evaluate("window.__totalDragX")
         dy = await self.page.evaluate("window.__totalDragY")
-        rect = await self.page.evaluate("window.__getMapRect()")
+        res = await self.page.evaluate(f"window.__getEdgePos('{edge}')")
 
-        # CSS 픽셀 기준 맵 영역 크기
-        map_w = rect['width']   # 1857/dpr
-        map_h = rect['height']  # 1080/dpr
+        # 맵 영역 크기 (absX/Y 반영)
+        rect = await self.page.evaluate("window.__getMapRect()")
+        map_w = rect['width']
+        map_h = rect['height']
         half_w = map_w / 2
         half_h = map_h / 2
 
-        # center = 해당 경계를 지정할 때의 totalDrag (화면 중심의 절대 위치)
-        # edge = 화면 끝단의 절대 위치 (center ± 맵 반폭/반높이)
         if edge == 'top':
-            self.bounds[edge] = {'center': dy, 'edge': dy - half_h}
+            self.bounds[edge] = {'center': dy, 'edge': dy - half_h, 'absY': res['absY']}
         elif edge == 'bottom':
-            self.bounds[edge] = {'center': dy, 'edge': dy + half_h}
+            self.bounds[edge] = {'center': dy, 'edge': dy + half_h, 'absY': res['absY']}
         elif edge == 'left':
-            self.bounds[edge] = {'center': dx, 'edge': dx - half_w}
+            self.bounds[edge] = {'center': dx, 'edge': dx - half_w, 'absX': res['absX']}
         elif edge == 'right':
-            self.bounds[edge] = {'center': dx, 'edge': dx + half_w}
+            self.bounds[edge] = {'center': dx, 'edge': dx + half_w, 'absX': res['absX']}
 
         # 미니맵 및 해당 썸네일 업데이트
         screenshot_bytes = await self.page.screenshot()
         self._ui(lambda: self._update_mini_map_image(screenshot_bytes, edge))
 
-        # 시각적 경계선 추가 (브라우저 내에 파란색 실선 표시)
+        # 시각적 경계선 추가
         await self.page.evaluate(f"window.__setBoundaryLine('{edge}')")
 
         self._ui(lambda: self._update_bound_status())
-        self.log(f"{edge.upper()} 경계 지정됨 (화면 끝 기준)")
+        self.log(f"{edge.upper()} 경계 지정됨 (문서 절대 좌표 기준)")
 
         # 모든 경계가 지정되었다면 격자 미리보기 생성
         if all(v is not None for v in self.bounds.values()):
