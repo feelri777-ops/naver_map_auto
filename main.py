@@ -13,9 +13,10 @@ import asyncio
 import math
 import re
 import io
+import json
 import threading
 import tkinter as tk
-from tkinter import messagebox, ttk
+from tkinter import messagebox, ttk, filedialog
 from PIL import Image, ImageTk
 from playwright.async_api import async_playwright
 import config
@@ -393,7 +394,7 @@ OVERLAY_JS = """
         window.__updateOverlayPosition();
         window.__updateBoundaryPositions();
         window.__updateGridPositions();
-    }, 30);
+    }, 200); // 30ms -> 200ms로 완화하여 CPU 부하 절감
 
     // 좌표 정보 및 드래그 추적
     window.__totalDragX = 0;
@@ -564,6 +565,14 @@ class App:
                                          command=self._on_naver_ui_toggle, state="disabled")
         self.btn_toggle_ui.pack(side="left", fill="x", expand=True)
 
+        self.btn_stitch = ttk.Button(step1, text="고해상도 병합", style="Green.TButton",
+                                      command=self._on_stitch, state="disabled")
+        self.btn_stitch.pack(side="left", padx=(6, 0), fill="x", expand=True)
+
+        self.btn_folder_stitch = ttk.Button(step1, text="파일 다중 병합", style="Secondary.TButton",
+                                           command=self._on_file_stitch)
+        self.btn_folder_stitch.pack(side="left", padx=(6, 0), fill="x", expand=True)
+
         # 2. 경계 지정 카드
         boundary_frame = ttk.LabelFrame(left_frame, text="  영역 경계 지정  ", style="Card.TLabelframe",
                                          padding=(12, 10))
@@ -693,7 +702,13 @@ class App:
                 "--disable-infobars",
                 "--disable-blink-features=AutomationControlled",
                 "--no-sandbox",
-                "--disable-dev-shm-usage"
+                "--disable-dev-shm-usage",
+                "--disable-gpu", # [추가] 성능 최적화
+                "--disable-setuid-sandbox",
+                "--no-first-run",
+                "--no-zygote",
+                "--single-process", # [추가] 프로세스 가볍게 (단일 프로세스 모드)
+                "--disable-extensions"
             ],
             ignore_default_args=["enable-automation"],
             locale="ko-KR",
@@ -916,43 +931,45 @@ class App:
         """)
 
     def _update_mini_map_image(self, screenshot_bytes, edge=None):
-        """미니맵 및 방향별 썸네일 업데이트"""
-        img = Image.open(io.BytesIO(screenshot_bytes))
-        w, h = img.size
-
-        # 캔버스의 실제 표시 크기를 사용 (레이아웃 후 크기)
-        cw = self.canvas.winfo_width()
-        ch = self.canvas.winfo_height()
-        if cw < 10: cw = self.canvas_width
-        if ch < 10: ch = self.canvas_height
-
-        # 메인 미니맵 업데이트
-        ratio = min(cw / w, ch / h)
-        new_w, new_h = int(w * ratio), int(h * ratio)
-        resized = img.resize((new_w, new_h), Image.Resampling.LANCZOS)
-
-        self.overview_img = img
-        self.overview_photo = ImageTk.PhotoImage(resized)
-
-        self.canvas.delete("all")
-        self.canvas.create_image(cw // 2, ch // 2, anchor="center", image=self.overview_photo)
-
-        # 현재 촬영 완료된 모든 경계선 그리기 (미완성)
-        self._draw_bounds_on_canvas()
-
-        # 특정 방향 썸네일 업데이트
-        if edge and edge in self.thumb_canvases:
-            t_w, t_h = 160, 100
-            t_ratio = min(t_w / w, t_h / h)
-            t_new_w, t_new_h = int(w * t_ratio), int(h * t_ratio)
-            t_resized = img.resize((t_new_w, t_new_h), Image.Resampling.LANCZOS)
-            
-            photo = ImageTk.PhotoImage(t_resized)
-            self.thumb_photos[edge] = photo # 참조 유지
-            
-            canvas = self.thumb_canvases[edge]
-            canvas.delete("all")
-            canvas.create_image(t_w//2, t_h//2, anchor="center", image=photo)
+        """미니맵 및 방향별 썸네일 업데이트 (메모리 최적화 버전)"""
+        with Image.open(io.BytesIO(screenshot_bytes)) as img:
+            w, h = img.size
+    
+            # 캔버스의 실제 표시 크기를 사용
+            cw = self.canvas.winfo_width()
+            ch = self.canvas.winfo_height()
+            if cw < 10: cw = self.canvas_width
+            if ch < 10: ch = self.canvas_height
+    
+            # 메인 미니맵 업데이트
+            ratio = min(cw / w, ch / h)
+            new_w, new_h = int(w * ratio), int(h * ratio)
+            resized = img.resize((new_w, new_h), Image.Resampling.LANCZOS)
+    
+            # 기존 이미지 명시적 삭제 후 갱신
+            self.overview_img = None 
+            self.overview_photo = ImageTk.PhotoImage(resized)
+    
+            self.canvas.delete("all")
+            self.canvas.create_image(cw // 2, ch // 2, anchor="center", image=self.overview_photo)
+    
+            self._draw_bounds_on_canvas()
+    
+            # 특정 방향 썸네일 업데이트
+            if edge and edge in self.thumb_canvases:
+                t_w, t_h = 160, 100
+                t_ratio = min(t_w / w, t_h / h)
+                t_new_w, t_new_h = int(w * t_ratio), int(h * t_ratio)
+                t_resized = img.resize((t_new_w, t_new_h), Image.Resampling.LANCZOS)
+                
+                # 가비지 컬렉션 유도
+                self.thumb_photos[edge] = None
+                photo = ImageTk.PhotoImage(t_resized)
+                self.thumb_photos[edge] = photo
+                
+                canvas = self.thumb_canvases[edge]
+                canvas.delete("all")
+                canvas.create_image(t_w//2, t_h//2, anchor="center", image=photo)
 
     def _draw_bounds_on_canvas(self):
         # (기존 미니맵 위에 빨간 점이나 선을 그리는 로직 - 필요시 추가 가능)
@@ -1088,13 +1105,79 @@ class App:
             self._ui(lambda: self.btn_stop.config(state="disabled"))
             self._ui(lambda: self.btn_reset.config(state="normal"))
             self.log(f"=== 완료! {success}/{total}장 ===")
-            self._ui(lambda: messagebox.showinfo("완료", f"{s}/{t}장 다운로드 완료!\n\n저장 경로:\n{dp}"))
+            
+            # --- 메타데이터 저장 ---
+            metadata = {
+                "rows": rows,
+                "cols": cols,
+                "css_step_x": x_step,
+                "css_step_y": y_step,
+                "css_tile_w": map_w_css,
+                "css_tile_h": map_h_css,
+                "total_tiles": total,
+                "timestamp": self.loop.time()
+            }
+            meta_path = os.path.join(self.download_path, "metadata.json")
+            with open(meta_path, "w", encoding="utf-8") as f:
+                json.dump(metadata, f, indent=4)
+            self.log(f"메타데이터 저장 완료: {meta_path}")
+
+            self._ui(lambda: self.btn_stitch.config(state="normal"))
+            self._ui(lambda: messagebox.showinfo("완료", f"{s}/{t}장 다운로드 완료!\n\n메타데이터가 생성되었습니다.\n'고해상도 병합' 버튼을 누르세요."))
 
         except Exception as e:
             self.log(f"촬영 오류: {e}")
             self._ui(lambda: self.status_var.set("오류 발생! 로그를 확인하세요"))
             self._ui(lambda: self.btn_stop.config(state="disabled"))
             self._ui(lambda: self.btn_reset.config(state="normal"))
+
+    def _on_stitch(self):
+        """병합 프로세스 실행 (외부 스크립트 호출 또는 내부 로직)"""
+        from stitch_map import MapStitcher
+        
+        def run_stitch():
+            self._ui(lambda: self.status_var.set("이미지 병합 중... (고해상도)"))
+            self.log("병합 시작...")
+            try:
+                stitcher = MapStitcher(self.download_path)
+                output_path = stitcher.stitch()
+                self._ui(lambda: self.status_var.set("병합 완료!"))
+                self.log(f"병합 성공: {output_path}")
+                self._ui(lambda: messagebox.showinfo("병합 완료", f"이미지 병합이 완료되었습니다!\n\n파일 위치:\n{output_path}"))
+            except Exception as e:
+                self.log(f"병합 실패: {e}")
+                self._ui(lambda: self.status_var.set("병합 실패!"))
+                self._ui(lambda: messagebox.showerror("오류", f"병합 중 오류 발생: {e}"))
+
+        threading.Thread(target=run_stitch, daemon=True).start()
+
+    def _on_file_stitch(self):
+        """여러 이미지 파일을 직접 선택하여 병합"""
+        file_paths = filedialog.askopenfilenames(
+            initialdir=config.DOWNLOAD_DIR,
+            title="병합할 이미지 파일들을 모두 선택하세요",
+            filetypes=[("Image files", "*.png *.jpg *.jpeg *.bmp"), ("All files", "*.*")]
+        )
+        if not file_paths: return
+        
+        from stitch_map import MapStitcher
+        
+        def run_stitch():
+            self._ui(lambda: self.status_var.set("선택된 파일 병합 중..."))
+            self.log(f"파일 다중 병합 시작: {len(file_paths)}장")
+            try:
+                # 폴더 경로 대신 파일 리스트를 직접 전달
+                stitcher = MapStitcher(file_list=list(file_paths))
+                output_path = stitcher.stitch()
+                self._ui(lambda: self.status_var.set("파일 병합 완료!"))
+                self.log(f"병합 성공: {output_path}")
+                self._ui(lambda: messagebox.showinfo("병합 완료", f"선택하신 {len(file_paths)}장의 이미지 병합이 완료되었습니다!\n\n파일 위치:\n{output_path}"))
+            except Exception as e:
+                self.log(f"파일 병합 실패: {e}")
+                self._ui(lambda: self.status_var.set("병합 실패!"))
+                self._ui(lambda: messagebox.showerror("오류", f"병합 중 오류 발생:\n{e}"))
+
+        threading.Thread(target=run_stitch, daemon=True).start()
 
     def run(self):
         self.root.mainloop()

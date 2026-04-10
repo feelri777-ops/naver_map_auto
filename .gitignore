@@ -5,3 +5,7 @@ __pycache__/
 .vscode/
 .idea/
 *.log
+browser_data/
+downloads/
+.DS_Store
+__pycache__/
